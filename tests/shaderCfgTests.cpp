@@ -3948,6 +3948,7 @@ void TestNewShaderRecompilerScalarB64Alu() {
       EncodeSop1(0x10, 30, 26),       // s_bcnt1_i32_b64 s30, s[26:27]
       EncodeSop1(0x14, 31, 26),       // s_ff1_i32_b64 s31, s[26:27]
       EncodeSop1(0x16, 106, 26),      // s_flbit_i32_b64 vcc_lo, s[26:27]
+      0xbeea1a0bu,                   // s_sext_i32_i16 vcc_lo, s11
       EncodeSop1(0x3b, 32, 30),       // s_bitreplicate_b64_b32 s[32:33], s30
       EncodeSop2(0x29, 34, 32, 255), // s_bfe_u64 s[34:35], s[32:33], 0x00040002
       0x00040002u,
@@ -4005,6 +4006,8 @@ void TestNewShaderRecompilerScalarB64Alu() {
         "new decoder did not decode RDNA2 S_FF1_I32_B64");
   Check((result.decoded_dump.find("s_flbit_i32_b64 vcc_lo, s26") != std::string::npos),
         "new decoder did not decode RDNA2 S_FLBIT_I32_B64");
+  Check((result.decoded_dump.find("s_sext_i32_i16 vcc_lo, s11") != std::string::npos),
+        "new decoder did not decode S_SEXT_I32_I16");
   Check((result.decoded_dump.find("s_bitreplicate_b64_b32 s32, s30") != std::string::npos),
         "new decoder did not decode old-backed S_BITREPLICATE_B64_B32");
   Check((result.decoded_dump.find("s_bfe_u64 s34, s32, 0x00040002") != std::string::npos),
@@ -6521,17 +6524,49 @@ void TestCustomVintrpMovTranslation() {
   Check(SpirvHasDecorationValue(mixed_linear_result.spirv, 11u, 5287u),
         "mixed linear input did not use BaryCoordNoPerspKHR");
   CheckSpirvBinaryValidates(mixed_linear_result.spirv);
+
+  std::vector<uint32_t> mixed_sample_shader(std::begin(mixed_shader), std::end(mixed_shader));
+  mixed_sample_shader[mixed_sample_shader.size() - 3] = EncodeExp0(0x00, 0x7);
+  mixed_sample_shader[mixed_sample_shader.size() - 2] = EncodeExp1(14, 0, 1, 0);
+  mixed_ps_info.ps_no_perspective = false;
+  mixed_ps_info.ps_system_input_base = 2;
+  mixed_ps_info.ps_perspective_sample_vgpr = 0;
+  mixed_ps_info.ps_sample_shading = true;
+  const auto mixed_sample_result = RecompileForTest(mixed_sample_shader, options);
+  const auto mixed_sample_source = DisassembleSpirvBinary(mixed_sample_result.spirv);
+  Check(SpirvHasDecorationValueWithDecoration(mixed_sample_result.spirv, 30u, 0u, 5285u) &&
+            SpirvDecorationValueCount(mixed_sample_result.spirv, 11u, 5286u) == 1u &&
+            SpirvHasDecorationValueWithDecoration(mixed_sample_result.spirv, 11u, 5286u, 17u) &&
+            SpirvSourceHasInstructionUsing(mixed_sample_source, "InterpolateAtOffset",
+                                         "%gl_BaryCoordSampleKHR") &&
+            SpirvInstructionOpcodeCount(mixed_sample_result.spirv, 133u) == 3u,
+        "per-vertex interpolation lost center weights alongside sample VGPRs");
+  CheckSpirvBinaryValidates(mixed_sample_result.spirv);
 }
 
-void TestPerspectiveCentroidInputs() {
-  constexpr std::array cases{std::array{4u, UINT32_MAX, 0u},
-                             std::array{5u, UINT32_MAX, 2u},
-                             std::array{6u, 0u, 2u}, std::array{7u, 2u, 4u}};
-  for (const auto &[inputs, center, centroid] : cases) {
-    const uint32_t other = center == UINT32_MAX ? centroid : center;
-    const std::vector<uint32_t> shader = {
-        EncodeExp0(0x00, 0xf), EncodeExp1(centroid, centroid + 1, other, other + 1),
-        EncodeSopp(0x01)};
+void TestPerspectiveInputs() {
+  using ShaderRecompiler::IR::StageInputKind;
+  constexpr std::array cases{std::array{1u, 0u, UINT32_MAX, UINT32_MAX},
+                             std::array{2u, UINT32_MAX, 0u, UINT32_MAX},
+                             std::array{3u, 0u, 2u, UINT32_MAX},
+                             std::array{4u, UINT32_MAX, UINT32_MAX, 0u},
+                             std::array{5u, 0u, UINT32_MAX, 2u},
+                             std::array{6u, UINT32_MAX, 0u, 2u},
+                             std::array{7u, 0u, 2u, 4u}};
+  for (const auto &[inputs, sample, center, centroid] : cases) {
+    const bool has_sample = sample != UINT32_MAX;
+    const bool has_center = center != UINT32_MAX;
+    const bool has_centroid = centroid != UINT32_MAX;
+    const std::array pairs{sample, center, centroid};
+    std::vector<uint32_t> shader;
+    uint32_t target = 0;
+    for (const auto pair : pairs) {
+      if (pair != UINT32_MAX) {
+        shader.push_back(EncodeExp0(target++, 0xf));
+        shader.push_back(EncodeExp1(pair, pair + 1, pair, pair + 1));
+      }
+    }
+    shader.push_back(EncodeSopp(0x01));
     HW::PixelShaderInfo regs{};
     regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader.data());
     ShaderMappedData mapped{};
@@ -6542,31 +6577,64 @@ void TestPerspectiveCentroidInputs() {
     const std::array<Prospero::ColorComponentMapping, 8> mappings{};
     ShaderPixelInputInfo pixel{};
     (void)PrepareProgram(regs, sh, mappings, pixel);
-    Check(pixel.ps_perspective_centroid_vgpr == centroid &&
+    Check(pixel.ps_perspective_sample_vgpr == sample &&
+              pixel.ps_perspective_centroid_vgpr == centroid &&
               pixel.ps_perspective_center_vgpr == center &&
-              pixel.ps_system_input_base == centroid + 2,
-          "perspective-centroid pair did not follow enabled sample/center inputs");
+              pixel.ps_system_input_base == 2u * std::popcount(inputs),
+          "perspective pairs did not follow enabled sample/center/centroid inputs");
     const auto key = MakeStageStaticKey(pixel);
-    pixel.ps_perspective_centroid_vgpr = UINT32_MAX;
-    Check(key != MakeStageStaticKey(pixel), "centroid input is missing from shader key");
-    pixel.ps_perspective_centroid_vgpr = centroid;
+    for (auto *input : {&pixel.ps_perspective_sample_vgpr,
+                        &pixel.ps_perspective_center_vgpr,
+                        &pixel.ps_perspective_centroid_vgpr}) {
+      if (*input != UINT32_MAX) {
+        const auto saved = *input;
+        *input = UINT32_MAX;
+        Check(key != MakeStageStaticKey(pixel),
+              "perspective input is missing from shader key");
+        *input = saved;
+      }
+    }
     auto options = MakeCompileOptions(ShaderType::Pixel);
     options.input_info.pixel = &pixel;
     const auto result = RecompileForTest(shader, options);
     const auto source = DisassembleSpirvBinary(result.spirv);
-    Check(SpirvContainsCapability(result.spirv, 52u) &&
-              SpirvHasDecorationValue(result.spirv, 11u, 5286u) &&
-              (source.find("InterpolateAtCentroid %gl_BaryCoordKHR") != std::string::npos) &&
-              SpirvSourceHasInstructionUsing(source, "OpCompositeExtract", " 1") &&
-              SpirvSourceHasInstructionUsing(source, "OpCompositeExtract", " 2"),
-          "centroid I/J did not evaluate BaryCoordKHR Y/Z at the centroid");
+    Check(ProgramHasInput(result.program, StageInputKind::BaryCoordSmoothSample) == has_sample &&
+              ProgramHasInput(result.program, StageInputKind::BaryCoordSmooth) ==
+                  (has_center || has_centroid),
+          "sample and center/centroid inputs did not retain distinct IR kinds");
+    Check(SpirvContainsCapability(result.spirv, 5284u) &&
+              SpirvDecorationValueCount(result.spirv, 11u, 5286u) == 1u,
+          "perspective inputs must share exactly one barycentric builtin");
+    Check(SpirvHasDecorationValueWithDecoration(result.spirv, 11u, 5286u, 17u) ==
+              has_sample && SpirvContainsCapability(result.spirv, 35u) == has_sample,
+          "sample I/J did not request Sample interpolation and SampleRateShading");
+    if (has_centroid) {
+      Check(SpirvContainsCapability(result.spirv, 52u) &&
+                SpirvContainsExtInst(result.spirv, 76u) &&
+                SpirvSourceHasInstructionUsing(source, "OpCompositeExtract", " 1") &&
+                SpirvSourceHasInstructionUsing(source, "OpCompositeExtract", " 2"),
+            "centroid I/J did not evaluate BaryCoordKHR Y/Z at the centroid");
+    }
     Check(!SpirvHasDecorationValueWithDecoration(result.spirv, 11u, 5286u, 16u),
           "centroid input changed the shared center builtin's interpolation location");
-    if (center != UINT32_MAX) {
-      Check(SpirvSourceHasInstructionUsing(source, "OpLoad", "%float "),
-            "center pair lost its ordinary barycentric loads when centroid was enabled");
-    }
     CheckSpirvBinaryValidates(result.spirv);
+    if (has_sample && has_center) {
+      Check(SpirvContainsCapability(result.spirv, 52u) &&
+                SpirvSourceHasInstructionUsing(source, "InterpolateAtOffset",
+                                             "%gl_BaryCoordSampleKHR") &&
+                SpirvSourceHasInstructionUsing(source, "OpConstantNull", "%v2float"),
+            "center I/J did not interpolate at offset zero alongside sample I/J");
+      const uint32_t center_shader[] = {
+          EncodeExp0(0x00, 0xf), EncodeExp1(center, center + 1, center, center + 1),
+          EncodeSopp(0x01)};
+      const auto center_result = RecompileForTest(center_shader, options);
+      Check(!ProgramHasInput(center_result.program, StageInputKind::BaryCoordSmoothSample) &&
+                !SpirvContainsCapability(center_result.spirv, 35u) &&
+                !SpirvHasDecorationValueWithDecoration(center_result.spirv, 11u, 5286u, 17u) &&
+                SpirvContainsExtInst(center_result.spirv, 78u),
+            "unused sample VGPRs changed center input interpolation");
+      CheckSpirvBinaryValidates(center_result.spirv);
+    }
   }
 }
 
@@ -7178,28 +7246,29 @@ void TestNewShaderRecompilerFlatOldBackedTranslation() {
 }
 
 void TestNewShaderRecompilerUnbasedFlatUsesBda() {
-  const uint32_t shader[] = {
-      EncodeFlat0(0x0c, 0, 0),
-      EncodeFlat1(0, 0x7d, 0, 1),
-      EncodeExp0(0x00, 0x1),
-      EncodeExp1(0, 0, 0, 0),
-      EncodeSopp(0x01),
-  };
-
-  auto options = MakeCompileOptions(ShaderType::Pixel);
-
-  auto result = RecompileForTest(shader, options);
-  Check(result.program.info.uses_dma &&
-            ShaderRecompiler::IR::FindBinding(
-                result.program.bindings,
-                ShaderRecompiler::IR::DescriptorBindingKind::BdaPagetable) !=
-                nullptr &&
-            ShaderRecompiler::IR::FindBinding(
-                result.program.bindings,
-                ShaderRecompiler::IR::DescriptorBindingKind::FaultBuffer) !=
-                nullptr,
-        "unbased FLAT did not compile through BDA");
-  CheckSpirvBinaryValidates(result.spirv);
+  using namespace ShaderRecompiler;
+  for (const bool dlc : {false, true}) {
+    const uint32_t shader[] = {
+        dlc ? 0xdc341000u : 0xdc340000u, 0x007d0004u,
+        EncodeExp0(0x00, 0x3), EncodeExp1(0, 1, 0, 0), EncodeSopp(0x01),
+    };
+    Decoder::Instruction decoded;
+    Decoder::DecodeInstruction(shader, 0, decoded);
+    Check(decoded.opcode == Decoder::Opcode::FLAT_LOAD_DWORDX2 && decoded.dlc == dlc &&
+              decoded.dst.reg == 0u && decoded.src0.reg == 4u && decoded.src1.reg == 5u,
+          "captured FLAT load did not preserve operands or cache policy");
+    const auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Pixel));
+    Check(result.program.info.uses_dma &&
+              IR::FindBinding(result.program.bindings,
+                              IR::DescriptorBindingKind::BdaPagetable) != nullptr &&
+              IR::FindBinding(result.program.bindings,
+                              IR::DescriptorBindingKind::FaultBuffer) != nullptr,
+          "unbased FLAT did not compile through BDA");
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    Check((source.find("Volatile|Aligned") != std::string::npos) == dlc,
+          "FLAT DLC load did not emit volatile physical memory access");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
 }
 
 void TestNewShaderRecompilerFlatSignedLoadTranslation() {
@@ -10582,19 +10651,32 @@ void TestMergedShaderUserDataSnapshot() {
   Check(fan_input.mesh.primitives_per_group == 30 && fan_input.mesh.vertices_per_group == 32 &&
             fan_input.mesh.max_vertices == 256 && fan_input.mesh.max_primitives == 192,
         "captured triangle-fan GS configuration lost its subgroup assembly limits");
-  context.SetShaderStages(0x00482030u);
-  context.SetMaxOutputPerSubgroup(32);
-  context.SetGsMaxVertOut(32);
   user_config.SetPrimitiveType(Prospero::PrimitiveType::kPointList);
   user_config.SetGeControl({1, 1});
   regs.gs_regs.rsrc1.gs_vgpr_component_count = 0;
   regs.gs_regs.rsrc2.es_vgpr_component_count = 1;
+  struct FastLaunchCase {
+    uint32_t vertices;
+    uint32_t wave;
+    uint32_t threads;
+  };
+  const FastLaunchCase fast_cases[] = {{64, 32, 64}, {65, 32, 96}, {65, 64, 128}, {32, 32, 32}};
   ShaderVertexInputInfo fast_input{};
-  PrepareProgram(regs, context, user_config, fast_input);
-  Check(fast_input.mesh.fast_launch && fast_input.mesh.threads_num[0] == 32 &&
-            fast_input.mesh.primitives_per_group == 1 && fast_input.mesh.vertices_per_group == 1 &&
-            fast_input.mesh.max_vertices == 32 && fast_input.mesh.max_primitives == 32,
-        "captured fast-launch shader lost its per-group launch and output limits");
+  for (const auto &test : fast_cases) {
+    context.SetMaxOutputPerSubgroup(test.vertices);
+    context.SetGsMaxVertOut(test.vertices);
+    for (const bool merged : {false, true}) {
+      context.SetShaderStages(0x00082010u | (test.wave == 32 ? 0x00400000u : 0u) |
+                              (merged ? 0x20u : 0u));
+      regs.gs_regs.rsrc2.lds_size = merged ? 0 : 64;
+      PrepareProgram(regs, context, user_config, fast_input);
+      Check(fast_input.mesh.fast_launch && fast_input.mesh.wave_size == test.wave &&
+                fast_input.mesh.threads_num[0] == test.threads &&
+                fast_input.mesh.primitives_per_group == 1 && fast_input.mesh.vertices_per_group == 1 &&
+                fast_input.mesh.max_vertices == test.vertices && fast_input.mesh.max_primitives == test.vertices,
+            "fast-launch shader lost its per-group launch and output limits");
+    }
+  }
   auto ordinary_input = fast_input;
   ordinary_input.mesh.fast_launch = false;
   Check(MakeStageStaticKey(fast_input) != MakeStageStaticKey(ordinary_input),
@@ -10620,6 +10702,39 @@ void TestMergedShaderUserDataSnapshot() {
             SpirvSourceHasInstructionUsing(fast_source, "OpExecutionMode", "OutputPrimitivesEXT 32"),
         "fast-launch SPIR-V truncated the mesh output capacity");
 
+  ShaderUserData native_data{};
+  mapped.user_data = &native_data;
+  ShaderMapUserData(regs.es_regs.data_addr, mapped);
+  context.SetShaderStages(0);
+  context.SetMaxOutputPerSubgroup(64);
+  context.SetGsMaxVertOut(0);
+  user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+  user_config.SetGeControl({64, 64});
+  ShaderVertexInputInfo native_input{};
+  const auto passthrough = PrepareProgram(regs, context, user_config, native_input);
+  Check(native_input.logical_stage == ShaderType::Vertex &&
+            passthrough.user_data_count == HW::UserSgprInfo::SGPRS_MAX,
+        "NGG without shared LDS did not retain the vertex path");
+  regs.gs_regs.rsrc2.lds_size = 64;
+  for (const auto primitive : {Prospero::PrimitiveType::kTriList,
+                               Prospero::PrimitiveType::kTriStrip}) {
+    user_config.SetPrimitiveType(primitive);
+    const auto params = PrepareProgram(regs, context, user_config, native_input);
+    Check(((uint64_t{params.user_data[1]} << 32u) | params.user_data[0]) ==
+              regs.gs_regs.user_data_addr,
+          "native GS did not initialize its s0:s1 user-data pointer");
+    const uint32_t primitives = primitive == Prospero::PrimitiveType::kTriList ? 21 : 62;
+    Check(native_input.logical_stage == ShaderType::Mesh &&
+              native_input.mesh.lds_size_dwords == 8192 &&
+              native_input.mesh.primitives_per_group == primitives &&
+              native_input.mesh.vertices_per_group == (primitives == 21 ? 63 : 64) &&
+              native_input.mesh.max_primitives == primitives &&
+              native_input.mesh.threads_num[0] == 64 && params.back_code.empty() &&
+              params.user_data_count == 8u + HW::UserSgprInfo::SGPRS_MAX &&
+              std::equal(std::begin(regs.gs_user_sgpr.value), std::end(regs.gs_user_sgpr.value),
+                         params.user_data.begin() + 8),
+          "native NGG lost its shared LDS, input assembly limits, or s8 user data");
+  }
 }
 
 void TestEmbeddedFetchPreservesSharedScalarLoad() {
@@ -12981,9 +13096,41 @@ void TestRenderTargetReverseExportMapping() {
         "inactive reverse MRT mapping was not normalized out of the shader "
       "cache key");
   sh.target_output_mode[0] = 4;
+  sh.m_cbShaderMask = 0x0000000fu;
   PrepareProgram(regs, sh, mappings, compiled_info);
   Check(compiled_info.target_export_mapping[0] == gr32.export_mapping,
       "active reverse MRT mapping was lost before shader specialization");
+
+  sh.m_cbShaderMask = 0x000000f0u;
+  sh.target_output_mode[1] = 5;
+  mappings[1] = format.export_mapping;
+  options.input_info.pixel = &compiled_info;
+  const uint32_t compressed_shader[] = {
+      EncodeExp0(0x00, 0xf, true, true), EncodeExp1(0, 1, 0, 0), 0xbf810000u,
+  };
+  for (const auto mode : {4u, 7u}) {
+    sh.target_output_mode[0] = mode;
+    PrepareProgram(regs, sh, mappings, compiled_info);
+    Check(compiled_info.target_output_mode[0] == mode &&
+              compiled_info.target_export_mapping[0] == mappings[1] &&
+              compiled_info.target_export_mapping[1].IsIdentity(),
+          "sparse MRT export did not retain its format and mapped component order");
+    const auto result = RecompileForTest(compressed_shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    Check(source.find("OpDecorate %out_mrt_0 Location 1") != std::string::npos &&
+              source.find(mode == 7u ? "OpVariable %_ptr_Output_v4uint Output"
+                                     : "OpVariable %_ptr_Output_v4float Output") !=
+                  std::string::npos,
+          "sparse MRT export selected the wrong location or output type");
+    Check(mode == 4u ? SpirvContainsExtInst(result.spirv, 62)
+                     : CountSourceOccurrences(source, "OpBitFieldUExtract") == 4u,
+          "sparse compressed export used the physical slot's decoding mode");
+  }
+  sh.target_output_mode[0] = 0;
+  PrepareProgram(regs, sh, mappings, compiled_info);
+  Check(compiled_info.target_export_mapping[0].IsIdentity(),
+        "disabled sparse export retained a component mapping");
 }
 
 void TestBlendMappingClassification() {
@@ -14675,13 +14822,14 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x01),
   };
   const auto structured_result = compile("structured-phi", structured_phi,
-                                         {.words = 140,
-                                          .instructions = 41,
+                                         {.words = 174,
+                                          .instructions = 49,
                                           .phis = 1,
                                           .labels = 8,
                                           .loop_merges = 1,
                                           .branches = 6,
-                                          .conditional_branches = 1});
+                                          .conditional_branches = 1,
+                                          .ballots = 2});
   const auto structured_metrics = MeasureSpirv(structured_result.spirv);
   Check((structured_result.ir_dump.find("Phi") != std::string::npos),
         "structured Phi size fixture no longer contains an IR Phi");
@@ -14692,13 +14840,14 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvPhiParents(structured_result.spirv);
   const auto structured_repeat =
       compile("structured-phi-repeat", structured_phi,
-              {.words = 140,
-               .instructions = 41,
+              {.words = 174,
+               .instructions = 49,
                .phis = 1,
                .labels = 8,
                .loop_merges = 1,
                .branches = 6,
-               .conditional_branches = 1});
+               .conditional_branches = 1,
+               .ballots = 2});
   Check(structured_repeat.spirv == structured_result.spirv,
         "deferred Phi patching is not deterministic");
 
@@ -14862,8 +15011,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
       EncodeSopp(0x01),
   };
   const auto dispatcher_result = compile("dispatcher", dispatcher,
-                                         {.words = 242,
-                                          .instructions = 67,
+                                         {.words = 255,
+                                          .instructions = 70,
                                           .variables = 3,
                                           .function_variables = 3,
                                           .loads = 3,
@@ -14874,7 +15023,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
                                           .selection_merges = 1,
                                           .branches = 10,
                                           .conditional_branches = 1,
-                                          .switches = 1});
+                                          .switches = 1,
+                                          .ballots = 1});
   Check(dispatcher_result.program.dispatcher_fallback &&
             (dispatcher_result.ir_dump.find("Phi") != std::string::npos) &&
             SpirvInstructionOpcodeCount(dispatcher_result.spirv, 245u) == 2u &&
@@ -14888,10 +15038,16 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 } // namespace
 } // namespace Libs::Graphics
 
-int main() {
+int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--perspective-inputs-only") == 0) {
+    TestCustomVintrpMovTranslation();
+    TestPerspectiveInputs();
+    return 0;
+  }
+  Check(argc == 1, "unknown test selector");
   TestRayTracingInstructions();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
@@ -15053,7 +15209,7 @@ int main() {
   TestNewShaderRecompilerNativeBindingPlan();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
-  TestPerspectiveCentroidInputs();
+  TestPerspectiveInputs();
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();
   TestComputeLdsAllocationIdentity();

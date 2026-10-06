@@ -413,7 +413,8 @@ uint32_t BuiltInForInput(IR::StageInputKind kind) {
 		case IR::StageInputKind::FrontFacing: return spv::BuiltInFrontFacing;
 		case IR::StageInputKind::Layer: return spv::BuiltInLayer;
 		case IR::StageInputKind::SampleId: return spv::BuiltInSampleId;
-		case IR::StageInputKind::BaryCoordSmooth: return spv::BuiltInBaryCoordKHR;
+		case IR::StageInputKind::BaryCoordSmooth:
+		case IR::StageInputKind::BaryCoordSmoothSample: return spv::BuiltInBaryCoordKHR;
 		case IR::StageInputKind::BaryCoordNoPerspective: return spv::BuiltInBaryCoordNoPerspKHR;
 		case IR::StageInputKind::WorkgroupId: return spv::BuiltInWorkgroupId;
 		case IR::StageInputKind::NumWorkgroups: return spv::BuiltInNumWorkgroups;
@@ -449,7 +450,14 @@ void DefineInputs(EmitterState& state) {
 			add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		}
 	}
+	const bool sample_barycentric =
+	    std::ranges::any_of(state.inputs, [](const InputBinding& input) {
+		    return input.kind == IR::StageInputKind::BaryCoordSmoothSample;
+	    });
 	for (auto& input: state.inputs) {
+		if (sample_barycentric && input.kind == IR::StageInputKind::BaryCoordSmooth) {
+			continue;
+		}
 		if (state.program.stage == ShaderType::Pixel &&
 		    input.kind == IR::StageInputKind::Parameter) {
 			const auto location = PixelParameterLocation(state, input.location);
@@ -478,6 +486,7 @@ void DefineInputs(EmitterState& state) {
 			case IR::StageInputKind::FragCoord: type = TypeF32Vector(state, 4); break;
 			case IR::StageInputKind::TessCoord:
 			case IR::StageInputKind::BaryCoordSmooth:
+			case IR::StageInputKind::BaryCoordSmoothSample:
 			case IR::StageInputKind::BaryCoordNoPerspective: type = TypeF32Vector(state, 3); break;
 			case IR::StageInputKind::FrontFacing: type = TypeBool(state); break;
 			case IR::StageInputKind::Parameter:
@@ -503,6 +512,9 @@ void DefineInputs(EmitterState& state) {
 		if (input.kind == IR::StageInputKind::Layer || input.kind == IR::StageInputKind::SampleId) {
 			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationFlat);
 		}
+		if (input.kind == IR::StageInputKind::BaryCoordSmoothSample) {
+			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationSample);
+		}
 		if (input.kind == IR::StageInputKind::Parameter) {
 			const auto flat = PixelParameterIsFlat(state, input.location);
 			if (input.per_vertex) {
@@ -522,6 +534,15 @@ void DefineInputs(EmitterState& state) {
 		} else if (const auto builtin = BuiltInForInput(input.kind); builtin != UINT32_MAX) {
 			state.builder.AddAnnotation(spv::OpDecorate, input.variable_id, spv::DecorationBuiltIn,
 			                            builtin);
+		}
+	}
+	if (sample_barycentric) {
+		// Vulkan permits only one input variable per BuiltIn. Evaluate center/centroid explicitly.
+		const auto variable = InputVariableForKind(state, IR::StageInputKind::BaryCoordSmoothSample);
+		for (auto& input: state.inputs) {
+			if (input.kind == IR::StageInputKind::BaryCoordSmooth) {
+				input.variable_id = variable;
+			}
 		}
 	}
 	if (state.requirements.subgroup_local_invocation_id) {
@@ -613,6 +634,16 @@ void DefineOutputs(EmitterState& state) {
 				break;
 			case IR::StageOutputKind::Parameter:
 			case IR::StageOutputKind::Mrt: {
+				const bool pixel_mrt = binding.kind == IR::StageOutputKind::Mrt &&
+				                       state.program.stage == ShaderType::Pixel;
+				const bool dual_source = pixel_mrt && state.input_info.pixel->dual_source_blending;
+				const auto location = pixel_mrt && !dual_source
+				                          ? ShaderPixelExportTarget(state.input_info.pixel->target_shader_mask,
+				                                                    binding.index)
+				                          : binding.location;
+				if (location == UINT32_MAX) {
+					continue;
+				}
 				const bool uint_output =
 				    binding.kind == IR::StageOutputKind::Mrt &&
 				    state.program.stage == ShaderType::Pixel &&
@@ -621,13 +652,10 @@ void DefineOutputs(EmitterState& state) {
 				const auto type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 				binding.variable_id = DefineInterfaceVariable(state, type, spv::StorageClassOutput,
 				                                              binding.debug_name.c_str());
-				const bool dual_source = binding.kind == IR::StageOutputKind::Mrt &&
-				                         state.program.stage == ShaderType::Pixel &&
-				                         state.input_info.pixel->dual_source_blending;
 				EXIT_NOT_IMPLEMENTED(dual_source && binding.index > 1);
 				state.builder.AddAnnotation(spv::OpDecorate, binding.variable_id,
 				                            spv::DecorationLocation,
-				                            dual_source ? 0u : binding.location);
+				                            dual_source ? 0u : location);
 				if (dual_source) {
 					state.builder.AddAnnotation(spv::OpDecorate, binding.variable_id,
 					                            spv::DecorationIndex, binding.index);
@@ -711,7 +739,8 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireVersion(0x00010500u);
 		state.builder.RequireCapability(spv::CapabilityShaderViewportIndex);
 	}
-	if (InputVariableForKind(state, IR::StageInputKind::SampleId) != 0) {
+	if (InputVariableForKind(state, IR::StageInputKind::SampleId) != 0 ||
+	    InputVariableForKind(state, IR::StageInputKind::BaryCoordSmoothSample) != 0) {
 		state.builder.RequireCapability(spv::CapabilitySampleRateShading);
 	}
 	if (state.requirements.image_gather_extended) {
@@ -736,6 +765,7 @@ void DefineModule(EmitterState& state) {
 	    state.program.stage == ShaderType::Pixel &&
 	    std::any_of(state.inputs.begin(), state.inputs.end(), [](const InputBinding& input) {
 		    return input.per_vertex || input.kind == IR::StageInputKind::BaryCoordSmooth ||
+		           input.kind == IR::StageInputKind::BaryCoordSmoothSample ||
 		           input.kind == IR::StageInputKind::BaryCoordNoPerspective;
 	    });
 	if (fragment_barycentric) {

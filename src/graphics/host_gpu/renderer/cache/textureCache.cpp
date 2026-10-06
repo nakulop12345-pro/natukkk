@@ -796,9 +796,10 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
 			return {depth_id};
 		}
-		// Equal pitch does not imply equal mip placement: a changed extent can move
-		// a level into or out of the mip tail. These are separate guest layouts.
+		// Equal pitch does not imply equal mip or layer placement.
 		if (requested.tile_mode != cached.info.tile_mode ||
+		    (requested.resources.layers < cached.info.resources.layers &&
+		     requested.data.size > cached.info.data.size) ||
 		    (requested.resources == cached.info.resources &&
 		     requested.mip_layout != cached.info.mip_layout)) {
 			if (safe_to_delete) {
@@ -823,13 +824,15 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			return {ExpandImage(requested, cached_id)};
 		}
 		// PPSA08394
-		// A view cannot change the native image type or grow its extent.
+		// Texture bounds use the descriptor width; Vulkan views cannot crop an image.
 		if (requested.data.size == cached.info.data.size &&
 		    requested.resources == cached.info.resources &&
 		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format) &&
 		    (requested.type != cached.info.type
 		         ? requested.extent == cached.info.extent
-		         : requested.extent.width > cached.info.extent.width &&
+		         : requested.extent.width != cached.info.extent.width &&
+		               (binding != BindingType::RenderTarget ||
+		                requested.extent.width > cached.info.extent.width) &&
 		               requested.extent.height >= cached.info.extent.height &&
 		               requested.extent.depth >= cached.info.extent.depth)) {
 			return {ExpandImage(requested, cached_id)};
@@ -892,26 +895,6 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	return {merged_id};
 }
 
-ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
-	RefreshCopySource(source_id);
-	const auto expanded_id = InsertImage(info);
-	auto&      source      = m_slot_images[source_id];
-	if (source.binding.is_bound || source.binding.is_target) {
-		source.binding.needs_rebind = true;
-	}
-	InitializeImage(expanded_id);
-	const int32_t mip = source.info.MipOf(info);
-	const int32_t layer = source.info.SliceOf(info, mip);
-	if (layer >= 0) {
-		CopyImageMip(expanded_id, source_id, static_cast<uint32_t>(mip),
-		             static_cast<uint32_t>(layer));
-	} else {
-		CopyImage(expanded_id, source_id);
-	}
-	FreeImage(source_id);
-	return expanded_id;
-}
-
 struct TextureCache::TextureTransfer {
 	TextureUploadLayout              layout;
 	std::vector<vk::BufferImageCopy> regions;
@@ -933,6 +916,38 @@ struct TextureCache::ImageDownload {
 	bool                depth_target = false;
 	bool                valid        = false;
 };
+
+ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
+	RefreshCopySource(source_id);
+	auto& source = m_slot_images[source_id];
+	if (source.info.data == info.data && source.info.type == info.type &&
+	    source.info.extent.width > info.extent.width && source.IsGpuModified() &&
+	    !source.IsBufferModified()) {
+		auto transfer = BuildDownload(source);
+		if (!transfer.valid) {
+			EXIT("TextureCache: cannot preserve GPU contents before narrowing an image\n");
+		}
+		// Keep texels outside the replacement extent in the guest-layout buffer.
+		const auto [buffer, offset] =
+		    m_buffer_cache.ObtainBuffer(source.info.data.address, source.info.data.size, true);
+		DownloadImage(source, *buffer, offset, source.info.data.size, std::move(transfer));
+	}
+	const auto expanded_id = InsertImage(info);
+	if (source.binding.is_bound || source.binding.is_target) {
+		source.binding.needs_rebind = true;
+	}
+	InitializeImage(expanded_id);
+	const int32_t mip = source.info.MipOf(info);
+	const int32_t layer = source.info.SliceOf(info, mip);
+	if (layer >= 0) {
+		CopyImageMip(expanded_id, source_id, static_cast<uint32_t>(mip),
+		             static_cast<uint32_t>(layer));
+	} else {
+		CopyImage(expanded_id, source_id);
+	}
+	FreeImage(source_id);
+	return expanded_id;
+}
 
 TextureCache::TextureTransfer
 TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
@@ -1791,14 +1806,12 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	const auto available  = buffer.Size() - buf_offset;
 	uint32_t   levels     = 0;
 	uint64_t   copy_size  = 0;
-	if (image.info.IsVolume()) {
-		// Volume mips contain strided block slices, so a mip's linear span cannot prove that
-		// every retained slice fits. Keep volume synchronization whole-image only.
-		if (!buffer.IsInBounds(image.info.data.address, image.info.data.size)) {
-			return false;
-		}
+	if (buffer.IsInBounds(image.info.data.address, image.info.data.size)) {
 		levels    = image.info.resources.levels;
 		copy_size = image.info.data.size;
+	} else if (image.info.IsVolume() || image.info.resources.layers > 1) {
+		// Array and volume mips contain strided slices; a partial mip span cannot cover them.
+		return false;
 	} else {
 		for (; levels < image.info.resources.levels; ++levels) {
 			const auto& mip = image.info.mip_layout[levels];
