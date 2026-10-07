@@ -4,7 +4,10 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/emulatorConfig.h"
 #include "common/stringUtils.h"
+#include "common/textShaping.h"
+#include "common/trophyStrings.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -23,6 +26,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -188,6 +192,7 @@ OverlaySession               g_session;
 SDL_Window*                  g_input_window               = nullptr;
 struct TrophyNotification {
 	std::string            name;
+	std::string            subtitle;
 	int32_t                grade;
 	std::vector<std::byte> icon_png;
 };
@@ -616,11 +621,66 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 	}
 }
 
+// The built-in ImGui font only covers basic Latin. Trophy text can be in any console language, so
+// the system fonts that cover the current language are merged in as fallbacks.
+void AddSystemFontFallbacks(ImGuiIO& io) {
+	const std::string_view locale = Common::Trophies::LocaleName(Config::GetConsoleLanguage());
+	std::vector<std::string> candidates;
+	const auto               add = [&](std::initializer_list<const char*> paths) {
+        for (const char* path: paths) {
+            std::error_code error;
+            if (std::filesystem::is_regular_file(path, error)) {
+                candidates.emplace_back(path);
+                return;
+            }
+        }
+	};
+	// Latin extended, Greek, Cyrillic, Vietnamese and Arabic.
+	add({"C:/Windows/Fonts/segoeui.ttf", "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+	     "/Library/Fonts/Arial Unicode.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+	     "/usr/share/fonts/TTF/DejaVuSans.ttf"});
+	const char* noto_cjk[] = {"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+	                          "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+	                          "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc"};
+	if (locale == "ja-JP") {
+		add({"C:/Windows/Fonts/meiryo.ttc", "C:/Windows/Fonts/YuGothM.ttc", "C:/Windows/Fonts/msgothic.ttc",
+		     "/System/Library/Fonts/Hiragino Sans GB.ttc", noto_cjk[0], noto_cjk[1], noto_cjk[2]});
+	} else if (locale == "ko-KR") {
+		add({"C:/Windows/Fonts/malgun.ttf", "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+		     noto_cjk[0], noto_cjk[1], noto_cjk[2]});
+	} else if (locale == "zh-Hans") {
+		add({"C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simsun.ttc",
+		     "/System/Library/Fonts/PingFang.ttc", noto_cjk[0], noto_cjk[1], noto_cjk[2]});
+	} else if (locale == "zh-Hant") {
+		add({"C:/Windows/Fonts/msjh.ttc", "C:/Windows/Fonts/mingliu.ttc",
+		     "/System/Library/Fonts/PingFang.ttc", noto_cjk[0], noto_cjk[1], noto_cjk[2]});
+	} else if (locale == "th-TH") {
+		add({"C:/Windows/Fonts/leelawui.ttf", "C:/Windows/Fonts/tahoma.ttf",
+		     "/System/Library/Fonts/Supplemental/Ayuthaya.ttf",
+		     "/usr/share/fonts/truetype/tlwg/Garuda.ttf"});
+	} else if (locale == "ar-AE") {
+		add({"C:/Windows/Fonts/tahoma.ttf", "C:/Windows/Fonts/arial.ttf"});
+	}
+	io.Fonts->AddFontDefault();
+	for (const auto& path: candidates) {
+		ImFontConfig config;
+		config.MergeMode = true;
+		if (io.Fonts->AddFontFromFileTTF(path.c_str(), 0.0f, &config) == nullptr) {
+			LOGF("[Trophy] could not load fallback font %s\n", path.c_str());
+		}
+	}
+}
 void NotifyTrophyUnlocked(std::string_view name, int32_t grade,
                           std::span<const std::byte> icon_png) {
+	static const Common::Trophies::Strings strings = [] {
+		const char* base = SDL_GetBasePath();
+		return Common::Trophies::Strings::Load(std::filesystem::path(base != nullptr ? base : "") /
+		                                           Common::Trophies::StringsDirectory,
+		                                       Config::GetConsoleLanguage());
+	}();
 	std::scoped_lock lock(g_trophy_notification_mutex);
-	g_trophy_notifications.push_back(
-	    {std::string(name), grade, std::vector<std::byte>(icon_png.begin(), icon_png.end())});
+	g_trophy_notifications.push_back({std::string(name), strings.Get("trophy.toast.earned"), grade,
+	                                 std::vector<std::byte>(icon_png.begin(), icon_png.end())});
 	g_trophy_notification_active.store(true, std::memory_order_release);
 }
 
@@ -663,6 +723,7 @@ struct SystemOverlay::Impl {
 		io.ConfigNavCursorVisibleAlways = true;
 		io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
 		io.BackendPlatformName = "Kyty system overlay input";
+		AddSystemFontFallbacks(io);
 		ImGui::StyleColorsDark();
 		auto& style          = ImGui::GetStyle();
 		style.WindowRounding = 10.0f;
@@ -1101,7 +1162,80 @@ struct SystemOverlay::Impl {
 		               0.65f, 1.25f);
 		const float width = std::max(
 		    0.0f, std::min(520.0f * screen_scale, static_cast<float>(frame_extent.width) - 32.0f));
-		const float  height   = 104.0f * screen_scale;
+		const float  pad       = 10.0f * screen_scale;
+		const float  base_h    = 104.0f * screen_scale;
+		const float  icon_size = base_h - 2.0f * pad;
+		const int    grade     = trophy_notification->grade;
+		const float  title_fs  = 26.0f * screen_scale;
+		const float  line_h    = 30.0f * screen_scale;
+		const float  sub_fs    = 20.0f * screen_scale;
+		const float  text_pad  = 16.0f * screen_scale;
+		const float  title_off = (grade > 0 && grade <= 4) ? 30.0f * screen_scale : 0.0f;
+		const float  text_x0   = (trophy_notification_image != nullptr)
+		                             ? 2.0f * pad + icon_size - pad + 18.0f * screen_scale
+		                             : 20.0f * screen_scale;
+		const float  wrap_w    = std::max(40.0f, width - text_x0 - title_off - text_pad);
+		// Greedy word wrap: lines only break at spaces so words are never split.
+		std::vector<std::string> title_lines;
+		{
+			auto*       font = ImGui::GetFont();
+			std::string line;
+			std::string word;
+			const auto  fits = [&](const std::string& s) {
+                return font->CalcTextSizeA(title_fs, FLT_MAX, 0.0f, s.c_str()).x <= wrap_w;
+			};
+			bool       space_before = false;
+			const auto flush_word   = [&] {
+				if (word.empty()) {
+					return;
+				}
+				const auto candidate = line.empty() ? word : line + (space_before ? " " : "") + word;
+				if (line.empty() || fits(candidate)) {
+					line = candidate;
+				} else {
+					title_lines.push_back(line);
+					line = word;
+				}
+				word.clear();
+			};
+			// Chinese, Japanese and similar text has no spaces, so it may break between characters.
+			const auto& name = trophy_notification->name;
+			for (size_t i = 0; i < name.size(); ++i) {
+				const auto byte = static_cast<unsigned char>(name[i]);
+				if (name[i] == ' ') {
+					flush_word();
+					space_before = true;
+				} else if (byte >= 0xE0 && byte <= 0xE9 && i + 2 < name.size()) {
+					// Thai vowel and tone marks combine with the previous letter and must not start a line.
+					const bool thai_mark =
+					    byte == 0xE0 && static_cast<unsigned char>(name[i + 1]) == 0xB8 &&
+					            static_cast<unsigned char>(name[i + 2]) == 0xB1 ||
+					    byte == 0xE0 && static_cast<unsigned char>(name[i + 1]) == 0xB8 &&
+					        static_cast<unsigned char>(name[i + 2]) >= 0xB4 &&
+					        static_cast<unsigned char>(name[i + 2]) <= 0xBA ||
+					    byte == 0xE0 && static_cast<unsigned char>(name[i + 1]) == 0xB9 &&
+					        static_cast<unsigned char>(name[i + 2]) >= 0x87 &&
+					        static_cast<unsigned char>(name[i + 2]) <= 0x8E;
+					if (thai_mark && word.empty() && !line.empty()) {
+						line.append(name, i, 3);
+					} else {
+						flush_word();
+						space_before = false;
+						word.assign(name, i, 3);
+						flush_word();
+					}
+					i += 2;
+				} else {
+					word += name[i];
+				}
+			}
+			flush_word();
+			if (!line.empty() || title_lines.empty()) {
+				title_lines.push_back(line);
+			}
+		}
+		const float  block_h  = static_cast<float>(title_lines.size()) * line_h + 28.0f * screen_scale;
+		const float  height   = std::max(base_h, block_h + 2.0f * 16.0f * screen_scale);
 		const float  rounding = 14.0f * screen_scale;
 		const float  fade_in  = std::clamp(age / 0.22f, 0.0f, 1.0f);
 		const float  fade_out = std::clamp((TOAST_LIFETIME - age) / 0.4f, 0.0f, 1.0f);
@@ -1121,11 +1255,9 @@ struct SystemOverlay::Impl {
 		draw->AddRect(top_left, bottom_right, fade(255, 255, 255, 28), rounding,
 		              ImDrawFlags_RoundCornersAll, 1.0f);
 
-		const float pad       = 10.0f * screen_scale;
-		const float icon_size = height - 2.0f * pad;
 		float       text_left = top_left.x + 20.0f * screen_scale;
 		if (trophy_notification_image != nullptr) {
-			const ImVec2 icon_min {top_left.x + pad, top_left.y + pad};
+			const ImVec2 icon_min {top_left.x + pad, top_left.y + (height - icon_size) * 0.5f};
 			const ImVec2 icon_max {icon_min.x + icon_size, icon_min.y + icon_size};
 			draw->AddImageRounded(trophy_notification_image->GetTexRef(), icon_min, icon_max,
 			                      {0, 0}, {1, 1}, fade(255, 255, 255, 255), 8.0f * screen_scale);
@@ -1137,8 +1269,7 @@ struct SystemOverlay::Impl {
 		constexpr std::array GRADE_COLORS {IM_COL32(161, 225, 245, 255), IM_COL32(255, 207, 82, 255),
 		                                   IM_COL32(211, 220, 232, 255),
 		                                   IM_COL32(211, 142, 91, 255)};
-		const int            grade     = trophy_notification->grade;
-		const float          title_y   = top_left.y + height * 0.5f - 25.0f * screen_scale;
+		const float          title_y   = top_left.y + (height - block_h) * 0.5f;
 		float                title_x   = text_left;
 		if (grade > 0 && grade <= static_cast<int>(GRADE_COLORS.size())) {
 			// Small cup glyph tinted with the trophy grade.
@@ -1158,10 +1289,15 @@ struct SystemOverlay::Impl {
 			title_x += 30.0f * u;
 		}
 		draw->PushClipRect(top_left, {bottom_right.x - 16.0f * screen_scale, bottom_right.y}, true);
-		draw->AddText(nullptr, 26.0f * screen_scale, {title_x, title_y},
-		              fade(255, 255, 255, 255), trophy_notification->name.c_str());
-		draw->AddText(nullptr, 20.0f * screen_scale, {text_left, title_y + 38.0f * screen_scale},
-		              fade(176, 180, 192, 255), "Trophy earned!");
+		float line_y = title_y;
+		for (const auto& line : title_lines) {
+			draw->AddText(nullptr, title_fs, {title_x, line_y}, fade(255, 255, 255, 255),
+			              Common::Trophies::PrepareDisplayText(line).c_str());
+			line_y += line_h;
+		}
+		draw->AddText(nullptr, sub_fs, {text_left, line_y + 8.0f * screen_scale},
+		              fade(176, 180, 192, 255),
+		              Common::Trophies::PrepareDisplayText(trophy_notification->subtitle).c_str());
 		draw->PopClipRect();
 	}
 
