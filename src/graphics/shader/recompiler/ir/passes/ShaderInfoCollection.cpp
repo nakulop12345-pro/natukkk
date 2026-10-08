@@ -152,6 +152,7 @@ void ValidateValueReferences(const Program& program, ShaderStageInputInfo input_
 							break;
 						case StageInputKind::TessCoord:
 						case StageInputKind::WorkgroupId:
+						case StageInputKind::NumWorkgroups:
 						case StageInputKind::LocalInvocationId:
 						case StageInputKind::GlobalInvocationId:
 							if (component >= 3u) {

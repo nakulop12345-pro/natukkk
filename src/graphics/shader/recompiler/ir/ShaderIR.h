@@ -471,9 +471,16 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	bool                             uses_ordered_append  = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
+
+// Release counter (GDS dword index) that emulates the ordered-append unit: the number of waves
+// that released their slot. It lives past the 64 KiB the guest can address and is zeroed
+// before every dispatch.
+inline constexpr uint32_t OrderedAppendReleaseCounter = 0x4001u;
+inline constexpr uint32_t OrderedAppendWaveIdMask     = 0x7ffu;
 
 struct BlockInfo {
 	uint32_t        id       = 0;
