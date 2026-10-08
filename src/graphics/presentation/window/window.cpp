@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/renderDoc.h"
+#include "graphics/presentation/dlssFrameGeneration.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
@@ -725,6 +726,7 @@ void WindowContext::Run() {
 	constexpr uint64_t title_interval_ms = 1000;
 	auto               title_time        = SDL_GetTicks();
 	auto               title_frames      = loop.presented_frames.load(std::memory_order_relaxed);
+	auto               title_fg_frames   = loop.fg_presented_frames.load(std::memory_order_relaxed);
 
 	while (!loop.need_exit) {
 		if (loop.paused.load(std::memory_order_acquire)) {
@@ -740,12 +742,16 @@ void WindowContext::Run() {
 		const auto elapsed = now - title_time;
 		if (elapsed >= title_interval_ms) {
 			const auto frames = loop.presented_frames.load(std::memory_order_relaxed);
+			const auto fg_frames = loop.fg_presented_frames.load(std::memory_order_relaxed);
 			if (frames != 0) {
 				UpdateTitle(frames, static_cast<double>(frames - title_frames) * 1000.0 /
-				                        static_cast<double>(elapsed));
+				                        static_cast<double>(elapsed),
+				            static_cast<double>(fg_frames - title_fg_frames) * 1000.0 /
+				                static_cast<double>(elapsed));
 			}
 			title_time   = now;
 			title_frames = frames;
+			title_fg_frames = fg_frames;
 		}
 		const auto wait_ms = static_cast<int>(title_interval_ms - (now - title_time));
 		if (!HostInputWaitEvent(&loop.event, wait_ms)) {
@@ -930,7 +936,7 @@ void WindowContext::UpdateIcon() {
 	}
 }
 
-void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
+void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps, double display_fps) {
 	static char title[128];
 	static char title_id[12];
 	static char app_ver[12];
@@ -940,6 +946,9 @@ void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 	static bool has_app_ver =
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
 	static const std::string processor_name = Common::GetSystemInfo().ProcessorName;
+	const bool dlss_active = loop.dlss_active.load(std::memory_order_relaxed);
+	const bool dlss_bypassed = loop.dlss_bypassed.load(std::memory_order_relaxed);
+	const bool fg_enabled = loop.fg_enabled.load(std::memory_order_relaxed);
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	static constexpr auto build_type = "Debug";
@@ -951,10 +960,13 @@ void WindowContext::UpdateTitle(uint64_t frame_num, double current_fps) {
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
 	auto text = fmt::format(
-	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
+	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}{}{}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
-	    device_name, processor_name, frame_num, current_fps);
+	    device_name, processor_name, frame_num, fg_enabled ? display_fps : current_fps,
+	    Config::GetDlssMode() == Config::DlssMode::Off ? "" :
+	        (dlss_active ? " [DLSS: active]" : dlss_bypassed ? " [DLSS: bypassed, source >= output]" : " [DLSS: inactive]"),
+	    fg_enabled ? " [FG]" : "");
 
 	SDL_SetWindowTitle(window, text.c_str());
 }

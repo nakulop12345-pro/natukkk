@@ -1,4 +1,5 @@
 #include "graphics/presentation/videoOut.h"
+#include "graphics/presentation/framePacer.h"
 
 #include "common/abi.h"
 #include "common/assert.h"
@@ -15,6 +16,7 @@
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/presentation/dlssFrameGeneration.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
 #include "kernel/pthread.h"
@@ -245,6 +247,7 @@ private:
 	std::list<Request>   m_cancelled_requests;
 	bool                 m_processing      = false;
 	uint64_t             m_next_request_id = 1;
+	Graphics::PresentSmoother m_smoother; // Only touched by the present thread.
 };
 
 struct VideoOutDriver::Impl {
@@ -856,12 +859,13 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
 
-	int64_t total_wait = 0;
+	Graphics::FramePacer pacer(frequency, Common::Timer::QueryPerformanceCounter());
 	while (!token.stop_requested()) {
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
-		if (total_wait > 0) {
+		const auto remaining = pacer.Remaining(sleep_begin);
+		if (remaining > 0) {
 			const auto remaining_us =
-			    (static_cast<uint64_t>(total_wait) * 1000000u + frequency - 1) / frequency;
+			    (remaining * 1000000u + frequency - 1) / frequency;
 			Common::Thread::SleepMicro(static_cast<uint32_t>(
 			    std::clamp<uint64_t>(remaining_us, 1, std::numeric_limits<uint32_t>::max())));
 		}
@@ -869,16 +873,13 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 			break;
 		}
 		const auto frame_begin = Common::Timer::QueryPerformanceCounter();
-		total_wait -= static_cast<int64_t>(frame_begin - sleep_begin);
 
 		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
-		const auto period  = std::max(frequency / refresh, uint64_t {1});
 
 		if (m_presenter.IsGuestPaused()) {
 			(void)m_presenter.PresentLastFrame();
 			const auto frame_end = Common::Timer::QueryPerformanceCounter();
-			total_wait +=
-			    static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
+			pacer.Advance(frame_end, refresh);
 			continue;
 		}
 
@@ -900,7 +901,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 				presented = true;
 			}
 		}
-		if (!presented && total_wait < 0) {
+		if (!presented && pacer.Late(frame_begin)) {
 			bool     any_open = false;
 			uint32_t width    = 0;
 			uint32_t height   = 0;
@@ -920,7 +921,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		VblankEnd();
 
 		const auto frame_end = Common::Timer::QueryPerformanceCounter();
-		total_wait += static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
+		pacer.Advance(frame_end, refresh);
 	}
 }
 
@@ -1077,10 +1078,12 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	uint32_t            height  = 0;
 	bool                current = false;
 	bool                premultiplied_alpha = false;
+	bool                process_dlss = false;
 	{
 		Common::LockGuard lock(cfg->mutex);
 		current = cfg->opened && !cfg->closing && cfg->generation == generation;
 		if (current) {
+			process_dlss = cfg->bus == VIDEO_OUT_BUS_TYPE_MAIN;
 			if (special) {
 				width  = cfg->width;
 				height = cfg->height;
@@ -1119,7 +1122,12 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
 		                                       &buffer);
 	} else {
-		frame = &m_presenter.PrepareFrame(buffer, source_info);
+		frame = &m_presenter.PrepareFrame(buffer, source_info, nullptr, process_dlss);
+	}
+	if (process_dlss) {
+		Common::LockGuard render_lock(buffer.GetContext().GetMutex());
+		buffer.EndRendering();
+		buffer.GetContext().GetGeometryMotion().AdvanceFrame();
 	}
 
 	Common::LockGuard lock(m_mutex);
@@ -1236,6 +1244,27 @@ bool FlipQueue::Flip(uint32_t micros) {
 	// Lock each port in bus order, then present and complete the whole group at one Vblank.
 	std::sort(requests.begin(), requests.begin() + count,
 	          [](const auto& a, const auto& b) { return a.cfg->bus < b.cfg->bus; });
+	// While Frame Generation interpolates, even out real-frame spacing. Hold at
+	// most part of this vblank, before taking the port locks guest threads use.
+	auto&      fg       = m_presenter.FrameGeneration();
+	const bool smooth   = fg.Enabled() && fg.Foreground();
+	const auto due_time = Common::Timer::QueryPerformanceCounter();
+	if (!smooth) {
+		m_smoother.Reset();
+	} else {
+		const auto owner_request = std::find_if(requests.begin(), requests.begin() + count,
+		                                        [group](const auto& r) { return r.id == group; });
+		bool owner_due = false;
+		{
+			Common::LockGuard cfg_lock(owner_request->cfg->mutex);
+			owner_due = IsFlipDueLocked(*owner_request->cfg, owner_request->generation);
+		}
+		const auto frequency = Common::Timer::QueryPerformanceFrequency();
+		const auto cap       = frequency / std::max(Config::GetVblankFrequency(), 1u) * 3 / 4;
+		if (const auto delay = owner_due ? m_smoother.Delay(due_time, cap) : 0; delay != 0) {
+			Common::Thread::SleepMicro(static_cast<uint32_t>(delay * 1000000u / frequency));
+		}
+	}
 	bool due = true;
 	std::array<Graphics::Presenter::Layer, VideoOutDriver::Impl::VIDEO_OUT_BUSES.size()> layers {};
 	for (size_t i = 0; i < count; i++) {
@@ -1249,6 +1278,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	}
 	if (due) {
 		m_presenter.Present(std::span(layers.data(), count));
+		if (smooth) m_smoother.Presented(due_time, Common::Timer::QueryPerformanceCounter());
 	}
 
 	m_mutex.Lock();

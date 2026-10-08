@@ -89,6 +89,9 @@ public:
 	enum class PresentMode { Fifo, Mailbox, Immediate };
 	Q_ENUM(PresentMode)
 
+	enum class DlssMode { Off, Quality, Balanced, Performance, UltraPerformance, DLAA };
+	Q_ENUM(DlssMode)
+
 	enum class LogDirection { Silent, Console, File };
 	Q_ENUM(LogDirection)
 
@@ -115,6 +118,9 @@ public:
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;
 	PresentMode            present_mode                = PresentMode::Mailbox;
+	DlssMode               dlss_mode                   = DlssMode::Off;
+	int                    render_scale_percent        = 100;
+	bool                   dlss_frame_generation       = false;
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hide_cursor_enabled         = false;
@@ -150,6 +156,9 @@ public:
 		user_id                     = other.user_id;
 		audio_input_device          = other.audio_input_device;
 		present_mode                = other.present_mode;
+		dlss_mode                   = other.dlss_mode;
+		render_scale_percent        = other.render_scale_percent;
+		dlss_frame_generation       = other.dlss_frame_generation;
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
 		hide_cursor_enabled         = other.hide_cursor_enabled;

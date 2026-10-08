@@ -15,6 +15,8 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/presentation/dlss.h"
+#include "graphics/presentation/dlssFrameGeneration.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
@@ -24,6 +26,7 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -413,11 +416,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
+	const std::array queue_priorities {1.0f, 1.0f};
+	const auto queue_families = physical_device.getQueueFamilyProperties();
+	graphics.present_queue_index = Config::DlssFrameGenerationEnabled() &&
+	    queue_families[queue_family].queueCount > 1 ? 1u : 0u;
 	vk::DeviceQueueCreateInfo queue_create_info {};
 	queue_create_info.queueFamilyIndex = queue_family;
-	queue_create_info.queueCount       = 1;
-	queue_create_info.pQueuePriorities = &queue_priority;
+	queue_create_info.queueCount       = graphics.present_queue_index + 1;
+	queue_create_info.pQueuePriorities = queue_priorities.data();
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -604,6 +610,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 
 	auto features13 = WindowContext::RequiredVulkan13Features();
+	// Streamline stores resource metadata in Vulkan private data slots. Its
+	// interposer requests the extension dependencies but the core feature must
+	// also be explicitly enabled by the host before plugin initialization.
+	if (HasExtension(device_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
+		EXIT_NOT_IMPLEMENTED(supported_features13.privateData != VK_TRUE);
+		features13.privateData = VK_TRUE;
+	}
 #if defined(__APPLE__)
 	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
 	                                           : static_cast<void*>(&features12);
@@ -648,7 +661,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	auto result = physical_device.createDevice(&create_info, nullptr, &device);
 	if (result != vk::Result::eSuccess) {
-		LOGF("vkCreateDevice failed: %s\n", vk::to_string(result).c_str());
+		Log::WriteToConsoleAndLog(fmt::format("vkCreateDevice failed on {}: {}\n",
+		    graphics.physical_device_properties.deviceName.data(), vk::to_string(result)));
 		return nullptr;
 	}
 
@@ -840,6 +854,14 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not load Vulkan: %s\n", SDL_GetError());
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
+	frame_generation = std::make_unique<DlssFrameGeneration>();
+	get_instance_proc_addr = frame_generation->Initialize(get_instance_proc_addr);
+	if (frame_generation->Hooked() && (Config::SpirvDebugPrintfEnabled() || Config::GpuAssistedValidationEnabled())) {
+		LOGF("DLSS Frame Generation unavailable with advanced shader validation; using native Vulkan\n");
+		frame_generation->Shutdown();
+		get_instance_proc_addr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
+	}
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
 	VulkanExtensions r;
 	VulkanGetExtensions(r);
@@ -878,7 +900,7 @@ void WindowContext::CreateVulkan() {
 	validation_features.pEnabledValidationFeatures     = enabled_features;
 
 	vk::DebugUtilsMessengerCreateInfoEXT dbg_create_info {};
-	dbg_create_info.pNext           = &validation_features;
+	dbg_create_info.pNext           = enabled_features_count ? &validation_features : nullptr;
 	dbg_create_info.messageSeverity = vk::DebugUtilsMessageSeverityFlagBitsEXT::eVerbose |
 	                                  vk::DebugUtilsMessageSeverityFlagBitsEXT::eInfo |
 	                                  vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning |
@@ -902,6 +924,8 @@ void WindowContext::CreateVulkan() {
 		LOGF("Vulkan instance: enabled %s\n", VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
 	}
 #endif
+	const bool dlss_instance_extensions =
+	    AppendDlssInstanceExtensions(r.required_extensions, r.available_extensions);
 	inst_info.pApplicationInfo        = &app_info;
 	inst_info.enabledExtensionCount   = static_cast<uint32_t>(r.required_extensions.size());
 	inst_info.ppEnabledExtensionNames = r.required_extensions.data();
@@ -910,7 +934,7 @@ void WindowContext::CreateVulkan() {
 	inst_info.ppEnabledLayerNames =
 	    (r.enable_validation_layers ? r.required_layers.data() : nullptr);
 
-	const vk::Result result = vk::createInstance(&inst_info, nullptr, &graphic_ctx.instance);
+	const vk::Result result = frame_generation->CreateInstance(inst_info, graphic_ctx.instance);
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eErrorIncompatibleDriver:
@@ -928,12 +952,9 @@ void WindowContext::CreateVulkan() {
 		}
 	}
 
-	vk::SurfaceKHR::CType native_surface = VK_NULL_HANDLE;
-	if (!SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
-	                              nullptr, &native_surface)) {
+	if (!frame_generation->CreateSurface(window, graphic_ctx.instance, surface)) {
 		EXIT("Could not create a Vulkan surface");
 	}
-	surface = native_surface;
 
 	std::vector<const char*> device_extensions = {
 	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
@@ -997,6 +1018,18 @@ void WindowContext::CreateVulkan() {
 			        nullptr, count, values);
 		    });
 
+		if (frame_generation->Hooked() &&
+		    !frame_generation->ConfigureDeviceExtensions(available_extensions, device_extensions)) {
+			// Streamline must stop injecting plugin requirements into vkCreateDevice.
+			// Its instance and physical-device handles are native Vulkan handles.
+			get_instance_proc_addr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
+			VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
+			VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.instance);
+		}
+		if (dlss_instance_extensions) {
+			graphic_ctx.dlss_extensions_enabled =
+			    AppendDlssDeviceExtensions(graphic_ctx, device_extensions, available_extensions);
+		}
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
@@ -1024,6 +1057,8 @@ void WindowContext::CreateVulkan() {
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
+	graphic_ctx.device.getQueue(graphic_ctx.queue_family, graphic_ctx.present_queue_index, &graphic_ctx.present_queue);
+	frame_generation->OnDevice(graphic_ctx);
 	EXIT_IF(graphic_ctx.queue == nullptr);
 
 	if (!graphic_ctx.CreateAllocator()) {
@@ -1046,12 +1081,9 @@ void WindowContext::RecreateSurface() {
 		graphic_ctx.instance.destroySurfaceKHR(surface, nullptr);
 		surface = nullptr;
 	}
-	vk::SurfaceKHR::CType native_surface = VK_NULL_HANDLE;
-	if (!SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
-	                              nullptr, &native_surface)) {
+	if (!frame_generation->CreateSurface(window, graphic_ctx.instance, surface)) {
 		EXIT("Could not recreate the Vulkan surface: %s\n", SDL_GetError());
 	}
-	surface = native_surface;
 }
 
 WindowContext::~WindowContext() {
@@ -1062,10 +1094,12 @@ WindowContext::~WindowContext() {
 
 	if (graphic_ctx.device != nullptr) {
 		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");
+		if (frame_generation) frame_generation->Shutdown();
 		graphic_ctx.DestroyAllocator();
 		graphic_ctx.device.destroy(nullptr);
 		graphic_ctx.device = nullptr;
 		graphic_ctx.queue  = nullptr;
+		graphic_ctx.present_queue = nullptr;
 	}
 	if (surface != nullptr) {
 		graphic_ctx.instance.destroySurfaceKHR(surface, nullptr);

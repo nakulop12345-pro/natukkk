@@ -11,9 +11,14 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/presentation/preparedFrameSelection.h"
+#include "graphics/presentation/dlss.h"
+#include "graphics/presentation/emulatorDlssInputs.h"
+#include "graphics/presentation/frameTiming.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/presentation/window/presentationFrame.h"
 
 #include <algorithm>
 #include <array>
@@ -26,17 +31,15 @@
 
 namespace Libs::Graphics {
 
-struct Presenter::Frame {
-	VulkanImage   image;
-	vk::ImageView view         = nullptr;
-	uint64_t      present_tick = 0;
-	bool          busy         = false;
-
-	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
-	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
-	void CopyFrom(CommandBuffer& command, Image& source);
-	void Clear(CommandBuffer& command, const vk::ClearColorValue& color);
-};
+namespace {
+vk::Format EncodedColorFormat(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR8G8B8A8Srgb: return vk::Format::eR8G8B8A8Unorm;
+		case vk::Format::eB8G8R8A8Srgb: return vk::Format::eB8G8R8A8Unorm;
+		default: return format;
+	}
+}
+} // namespace
 
 class FramePool final {
 public:
@@ -44,6 +47,7 @@ public:
 	    : m_window(window), m_scheduler(scheduler) {}
 	~FramePool() {
 		m_scheduler.Wait(m_scheduler.CurrentTick() - 1);
+		WaitFrameGenerationInputs();
 		for (auto& frame: m_frames) {
 			m_window.graphic_ctx.device.destroyImageView(frame->view, nullptr);
 			if (frame->image.image != nullptr) {
@@ -87,7 +91,7 @@ public:
 		return m_format;
 	}
 
-	Presenter::Frame* Acquire(vk::Extent2D extent, vk::Format format) {
+	Presenter::Frame* Acquire(vk::Extent2D extent, vk::Format format, bool storage = false) {
 		m_mutex.Lock();
 		if (m_frames.empty()) {
 			EXIT("prepared-frame pool was used before swapchain initialization\n");
@@ -99,14 +103,18 @@ public:
 			m_free.push_back(frame.get());
 			m_frames.push_back(std::move(frame));
 		}
-		const auto compatible = std::ranges::find_if(m_free, [&](const auto* frame) {
-			return frame->image.extent.width == extent.width &&
-			       frame->image.extent.height == extent.height && frame->image.format == format;
+		auto& master = m_scheduler.GetMasterSemaphore();
+		if (m_free.size() > 1) master.Refresh();
+		const auto index = m_free.size() == 1 ? 0 : SelectPreparedFrame(std::span<Presenter::Frame* const> {m_free}, [&](const auto& frame) {
+			return frame.image.extent.width == extent.width &&
+			       frame.image.extent.height == extent.height && frame.image.format == format &&
+			       (!storage || static_cast<bool>(frame.image.usage & vk::ImageUsageFlagBits::eStorage));
+		}, [&](const auto& frame) {
+			return master.IsFree(frame.present_tick) &&
+			       (!frame.fg_inputs || frame.fg_inputs->Ready(m_window.graphic_ctx));
 		});
-		auto*      frame      = compatible == m_free.end() ? m_free.back() : *compatible;
-		if (compatible != m_free.end()) {
-			*compatible = m_free.back();
-		}
+		auto* frame = m_free[index];
+		m_free[index] = m_free.back();
 		m_free.pop_back();
 		if (frame->busy) {
 			EXIT("prepared-frame pool returned an invalid frame\n");
@@ -115,7 +123,16 @@ public:
 		m_mutex.Unlock();
 
 		m_scheduler.Wait(frame->present_tick);
+		if (frame->fg_inputs) frame->fg_inputs->Wait(m_window.graphic_ctx);
 		return frame;
+	}
+
+	void WaitFrameGenerationInputs() {
+		Common::LockGuard render_lock(m_window.render_context->GetMutex());
+		Common::LockGuard lock(m_mutex);
+		for (auto& frame : m_frames) {
+			if (frame->fg_inputs) frame->fg_inputs->Wait(m_window.graphic_ctx);
+		}
 	}
 
 	void ValidateForPresent(Presenter::Frame* frame) {
@@ -146,14 +163,15 @@ private:
 	vk::Format                                     m_format = vk::Format::eUndefined;
 };
 
-void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format) {
+void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format, bool storage) {
 	if (extent.width == 0 || extent.height == 0 || format == vk::Format::eUndefined) {
 		EXIT("unsupported prepared frame, extent=%ux%u format=%d\n", extent.width, extent.height,
 		     static_cast<int>(format));
 	}
 	auto&      dst        = image;
 	const bool compatible = dst.image != nullptr && dst.extent.width == extent.width &&
-	                        dst.extent.height == extent.height && dst.format == format;
+	                        dst.extent.height == extent.height && dst.format == format &&
+	                        (!storage || static_cast<bool>(dst.usage & vk::ImageUsageFlagBits::eStorage));
 	if (compatible) {
 		return;
 	}
@@ -185,6 +203,7 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 	create.initialLayout = vk::ImageLayout::eUndefined;
 	create.usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
 	               vk::ImageUsageFlagBits::eSampled;
+	if (storage) create.usage |= vk::ImageUsageFlagBits::eStorage;
 	create.sharingMode = vk::SharingMode::eExclusive;
 	create.samples     = vk::SampleCountFlagBits::e1;
 	if (!graphics.CreateImage(create, dst)) {
@@ -234,6 +253,20 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(command, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite);
+	// Copy sRGB/UNORM pairs without decoding the guest's encoded color.
+	if (EncodedColorFormat(source.backing.format) != EncodedColorFormat(image.format) ||
+	    source.backing.extent != image.extent) {
+		vk::ImageBlit blit {};
+		blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		blit.srcOffsets[1] = {static_cast<int32_t>(source.backing.extent.width),
+		                      static_cast<int32_t>(source.backing.extent.height), 1};
+		blit.dstOffsets[1] = {static_cast<int32_t>(image.extent.width),
+		                      static_cast<int32_t>(image.extent.height), 1};
+		command.blitImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+		                  image.image, vk::ImageLayout::eTransferDstOptimal, 1, &blit, vk::Filter::eLinear);
+		return;
+	}
 	vk::ImageCopy copy {};
 	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, source.backing.layers};
 	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, image.layers};
@@ -267,13 +300,15 @@ public:
 	[[nodiscard]] bool   PrepareSystemOverlay();
 	void     RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
 	                               const Presenter::Layer& overlay, bool draw_system_overlay);
-	uint64_t Submit(CommandScheduler& scheduler);
+	uint64_t Submit(CommandScheduler& scheduler, uint64_t producer_tick);
 	[[nodiscard]] Status Present();
 
 	[[nodiscard]] uint32_t ImageCount() const noexcept {
 		return static_cast<uint32_t>(m_images.size());
 	}
 	[[nodiscard]] vk::Format Format() const noexcept { return m_format; }
+	[[nodiscard]] vk::Extent2D Extent() const noexcept { return m_extent; }
+	[[nodiscard]] vk::Image CurrentImage() const { return m_images[m_image_index]; }
 
 private:
 	void Destroy();
@@ -301,13 +336,32 @@ private:
 struct Presenter::Impl {
 	explicit Impl(WindowContext& owner)
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
-	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
+	      present_scheduler(renderer, owner.graphic_ctx, true), frames(owner, present_scheduler),
+	      dlss(owner.graphic_ctx, renderer.GetCommandScheduler()),
+	      emulator_inputs(owner.graphic_ctx, renderer.GetCommandScheduler()) {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
 	}
 
+	~Impl() {
+		// Prepared DLSS outputs can still be referenced by the producer stream
+		// even if they were never presented. Drain it before FramePool destruction.
+		Common::LockGuard render_lock(renderer.GetMutex());
+		auto& scheduler = renderer.GetCommandScheduler();
+		if (scheduler.Active()) scheduler.Finish();
+		if (window.frame_generation && window.frame_generation->Hooked()) {
+			// Normal teardown has stopped producers. Retire SDK work before
+			// destroying Vulkan resources and the standalone NGX backend.
+			present_scheduler.Wait(present_scheduler.CurrentTick() - 1);
+			frames.WaitFrameGenerationInputs();
+			window.frame_generation->SetEnabled(false);
+			RequireVulkanSuccess(window.graphic_ctx.device.waitIdle(), "drain FG before NGX shutdown");
+		}
+	}
+
 	void RecoverSwapchain(Swapchain::Status status) {
+		frames.WaitFrameGenerationInputs();
 		LOGF("Recovering Vulkan swapchain%s\n",
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
@@ -334,7 +388,7 @@ struct Presenter::Impl {
 		cache.UpdateImage(image_id);
 		return image;
 	}
-	void Present();
+	void Present(bool new_frame = true);
 
 	RenderContext&        renderer;
 	WindowContext&        window;
@@ -344,6 +398,17 @@ struct Presenter::Impl {
 	Common::Mutex         present_mutex;
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
+	DlssProcessor         dlss;
+	EmulatorDlssInputs    emulator_inputs;
+	vk::Extent2D          dlss_target_size {};
+	Config::DlssMode      dlss_mode = Config::DlssMode::Off;
+	vk::Extent2D          dlss_source_size {};
+	uint32_t              dlss_render_scale = 100;
+	bool                  dlss_reduced_source = false;
+	bool                  dlss_bypassed = false;
+	std::optional<vk::Extent2D> dlss_input_size;
+	bool                  emulator_dlss_logged = false;
+	FrameTimingRecorder   timing;
 };
 
 void Swapchain::Create() {
@@ -432,6 +497,12 @@ void Swapchain::Create() {
 		LOGF("warning: requested present mode is unavailable; falling back to Fifo\n");
 		create_info.presentMode = vk::PresentModeKHR::eFifo;
 	}
+	// Vulkan DLSS-G does not support VSync. The backend paces generated frames.
+	if (m_window.frame_generation && m_window.frame_generation->Enabled()) {
+		if (std::ranges::find(surface.present_modes, vk::PresentModeKHR::eImmediate) != surface.present_modes.end()) {
+			create_info.presentMode = vk::PresentModeKHR::eImmediate;
+		}
+	}
 	create_info.clipped = VK_TRUE;
 	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
 	                     "vkCreateSwapchainKHR");
@@ -490,7 +561,14 @@ void Swapchain::Destroy() {
 
 	{
 		Common::LockGuard queue_lock(graphics.queue_mutex);
-		RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
+		Common::LockGuard present_lock(graphics.present_queue_mutex);
+		if (m_window.frame_generation && m_window.frame_generation->Hooked()) {
+			// Streamline presents on its own queues and pacer thread. Its device
+			// idle proxy flushes those pending jobs as well as the host queue.
+			RequireVulkanSuccess(graphics.device.waitIdle(), "wait for Frame Generation presentation");
+		} else {
+			RequireVulkanSuccess((graphics.present_queue ? graphics.present_queue : graphics.queue).waitIdle(), "wait for swapchain queue");
+		}
 	}
 	if (m_system_overlay != nullptr) {
 		m_system_overlay->ReleaseVulkan();
@@ -823,10 +901,14 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	}
 }
 
-uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
+uint64_t Swapchain::Submit(CommandScheduler& scheduler, uint64_t producer_tick) {
 	EXIT_IF(m_frame_index >= m_image_acquired.size() || m_image_index >= m_render_complete.size());
 	SubmitInfo submit;
 	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
+	if (producer_tick) {
+		auto& producer = m_window.render_context->GetCommandScheduler();
+		submit.AddWait(producer.GetMasterSemaphore().Handle(), producer_tick);
+	}
 	submit.AddSignal(m_render_complete[m_image_index]);
 	return scheduler.Submit(submit);
 }
@@ -844,8 +926,10 @@ Swapchain::Status Swapchain::Present() {
 
 	vk::Result result;
 	{
-		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
-		result = m_window.graphic_ctx.queue.presentKHR(&present);
+		auto& graphics = m_window.graphic_ctx;
+		const auto queue = graphics.present_queue ? graphics.present_queue : graphics.queue;
+		Common::LockGuard lock(queue != graphics.queue ? graphics.present_queue_mutex : graphics.queue_mutex);
+		result = queue.presentKHR(&present);
 	}
 	switch (result) {
 		case vk::Result::eSuccess: break;
@@ -868,24 +952,144 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 
 Presenter::~Presenter() = default;
 
-Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info) {
+Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info,
+                                          const DlssFrameInputs* dlss_inputs, bool process_dlss) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
-	auto frame_format = info.pixel_format;
-	switch (frame_format) {
-		case vk::Format::eR8G8B8A8Srgb: frame_format = vk::Format::eR8G8B8A8Unorm; break;
-		case vk::Format::eB8G8R8A8Srgb: frame_format = vk::Format::eB8G8R8A8Unorm; break;
-		default: break;
-	}
-	auto* frame = m_impl->frames.Acquire({info.extent.width, info.extent.height}, frame_format);
+	const auto stamp = [&] { return m_impl->timing.Enabled() ? Common::Timer::QueryPerformanceCounter() : uint64_t(0); };
+	const auto prepare_begin = stamp();
+	const auto frame_format = EncodedColorFormat(info.pixel_format);
+	const vk::Extent2D output_size {Config::GetScreenWidth(), Config::GetScreenHeight()};
+	const vk::Extent2D source_hint {info.extent.width, info.extent.height};
+	const bool reconstruct_hint = process_dlss && m_impl->dlss.Available() &&
+	    (dlss_inputs || Config::GetDlssMode() == Config::DlssMode::DLAA ||
+	     Config::GetRenderScalePercent() < 100 || source_hint.width < output_size.width || source_hint.height < output_size.height);
+	// Only a reuse hint: the resolved image and validated inputs below still
+	// determine Configure. Wait before retaining cache images or locking the
+	// renderer, so presentation can submit while this frame is being retired.
+	auto* frame = m_impl->frames.Acquire(reconstruct_hint ? output_size : source_hint,
+	    reconstruct_hint ? vk::Format::eR16G16B16A16Sfloat : frame_format, reconstruct_hint);
+	const auto acquired = stamp();
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+	const auto locked = stamp();
 	auto&             image = m_impl->ResolveSurface(info);
 	if (image.backing.format == vk::Format::eUndefined) {
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
 	}
+	const auto resolved = stamp();
+	std::optional<DlssFrameInputs> generated_inputs;
+	const bool fg_available = Config::DlssFrameGenerationEnabled() && m_impl->window.frame_generation &&
+	    m_impl->window.frame_generation->Available() && m_impl->window.frame_generation->Foreground();
+	Image* temporal_source = &image;
+	if (process_dlss && (m_impl->dlss.Available() || fg_available)) {
+		const vk::Extent2D output_size {Config::GetScreenWidth(), Config::GetScreenHeight()};
+		if (dlss_inputs == nullptr) {
+			if (auto* reduced = buffer.RasterColorSource(image)) temporal_source = reduced;
+			const bool reduced_source = temporal_source != &image;
+			const vk::Extent2D source_size {temporal_source->backing.extent.width, temporal_source->backing.extent.height};
+			if (m_impl->dlss_target_size != output_size ||
+			    m_impl->dlss_source_size != source_size || m_impl->dlss_mode != Config::GetDlssMode() ||
+			    m_impl->dlss_render_scale != Config::GetRenderScalePercent() ||
+			    m_impl->dlss_reduced_source != reduced_source) {
+				// Read the actual last raster color when its content is still current.
+				// Materialized surfaces without that proof retain ordinary input sizing.
+				const auto hint = reduced_source || Config::GetRenderScalePercent() == 100 ? source_size : vk::Extent2D {};
+				m_impl->dlss_input_size = m_impl->dlss.OptimalInputExtent(output_size, hint);
+				// Not a failure: the guest already renders at least the output size.
+				m_impl->dlss_bypassed = !m_impl->dlss_input_size && m_impl->dlss.Available() &&
+				    Config::GetDlssMode() != Config::DlssMode::DLAA && hint.width >= output_size.width &&
+				    hint.height >= output_size.height;
+				if (m_impl->dlss_bypassed) {
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "DLSS Super Resolution bypassed: source {}x{} already covers output {}x{}; raise the output resolution to reconstruct\n",
+					    source_size.width, source_size.height, output_size.width, output_size.height));
+				}
+				m_impl->dlss_target_size = output_size;
+				m_impl->dlss_source_size = source_size;
+				m_impl->dlss_render_scale = Config::GetRenderScalePercent();
+				m_impl->dlss_reduced_source = reduced_source;
+				m_impl->dlss_mode = Config::GetDlssMode();
+				m_impl->emulator_inputs.Reset();
+			}
+			if (m_impl->dlss_input_size || fg_available) {
+				generated_inputs = m_impl->emulator_inputs.Prepare(buffer, *temporal_source,
+				    m_impl->dlss_input_size.value_or(source_size), m_impl->dlss_input_size.has_value(),
+				    m_impl->renderer.GetGeometryMotion().Source(image));
+				if (generated_inputs) dlss_inputs = &*generated_inputs;
+			}
+		} else {
+			m_impl->emulator_inputs.Reset();
+		}
+	}
+	const auto inputs_ready = stamp();
+	auto& graphics = m_impl->window.graphic_ctx;
+	const auto required = vk::FormatFeatureFlagBits::eStorageImage |
+	                      vk::FormatFeatureFlagBits::eBlitSrc |
+	                      vk::FormatFeatureFlagBits::eBlitDst |
+	                      vk::FormatFeatureFlagBits::eSampledImage |
+	                      vk::FormatFeatureFlagBits::eSampledImageFilterLinear;
+	const auto features = graphics.GetFormatProperties(vk::Format::eR16G16B16A16Sfloat).optimalTilingFeatures;
+	const bool reconstruct = process_dlss && dlss_inputs != nullptr && m_impl->dlss.Available() &&
+	    (!generated_inputs || m_impl->dlss_input_size.has_value()) &&
+	    (features & required) == required && output_size.width > 0 && output_size.height > 0 &&
+	    output_size.width <= graphics.physical_device_properties.limits.maxImageDimension2D &&
+	    output_size.height <= graphics.physical_device_properties.limits.maxImageDimension2D;
+	const vk::Extent2D source_size {image.backing.extent.width, image.backing.extent.height};
+	frame->dlss_evaluated = false;
+	frame->dlss_bypassed = process_dlss && m_impl->dlss_bypassed;
+	frame->guest_frame = true;
+	frame->producer_tick = m_impl->renderer.GetCommandScheduler().CurrentTick();
+	const bool fg_captured = process_dlss && fg_available && dlss_inputs &&
+	    CaptureDlssFgInputs(graphics, m_impl->renderer.GetCommandScheduler(), buffer, *dlss_inputs, frame->fg_inputs);
+	if (!fg_captured && frame->fg_inputs) {
+		m_impl->renderer.GetCommandScheduler().DeferOperation([old = std::move(frame->fg_inputs)]() mutable { old.reset(); });
+	}
+	const auto captured = stamp();
+	const auto finish_preparation = [&] {
+		frame->preparation = {acquired - prepare_begin, locked - acquired, resolved - locked,
+		                      inputs_ready - resolved, captured - inputs_ready, stamp() - captured};
+	};
+	if (reconstruct) {
+		frame->Configure(graphics, output_size, vk::Format::eR16G16B16A16Sfloat, true);
+		if (frame->view == nullptr) {
+			vk::ImageViewCreateInfo view {};
+			view.image = frame->image.image;
+			view.viewType = vk::ImageViewType::e2D;
+			view.format = frame->image.format;
+			view.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+			RequireVulkanSuccess(graphics.device.createImageView(&view, nullptr, &frame->view), "create DLSS output view");
+		}
+		frame->dlss_evaluated = m_impl->dlss.Evaluate(buffer, *dlss_inputs, frame->image, frame->view);
+		if (!frame->dlss_evaluated) {
+			if (frame->fg_inputs) frame->fg_inputs->jitter_x = frame->fg_inputs->jitter_y = 0;
+			m_impl->emulator_inputs.Reset();
+			// An UNORM view preserves sRGB color when resizing into RGBA16F.
+			if (!m_impl->emulator_inputs.ResampleColor(buffer, image, frame->image, frame->view)) {
+				frame->Configure(graphics, source_size, frame_format);
+				frame->CopyFrom(buffer, image);
+			}
+		} else if (generated_inputs && !m_impl->emulator_dlss_logged) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "DLSS emulator reconstruction active: {}x{} -> {}x{} -> {}x{}; GPU optical flow, final-frame mode\n",
+			    temporal_source->backing.extent.width, temporal_source->backing.extent.height,
+			    m_impl->dlss_input_size->width, m_impl->dlss_input_size->height,
+			    output_size.width, output_size.height));
+			m_impl->emulator_dlss_logged = true;
+		}
+		finish_preparation();
+		return *frame;
+	}
+	if (process_dlss) {
+		// Off presents the unjittered guest surface rather than the jittered
+		// reconstruction input. FG constants must describe that actual color.
+		if (frame->fg_inputs) frame->fg_inputs->jitter_x = frame->fg_inputs->jitter_y = 0;
+		m_impl->dlss.SkipFrame();
+		if (!fg_available) m_impl->emulator_inputs.Reset();
+	}
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	finish_preparation();
 	return *frame;
 }
 
@@ -894,6 +1098,11 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	KYTY_PROFILER_FUNCTION();
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
+	frame->dlss_evaluated = false;
+	frame->dlss_bypassed = false;
+	frame->guest_frame = false;
+	frame->preparation = {};
+	frame->producer_tick = producer ? m_impl->renderer.GetCommandScheduler().CurrentTick() : 0;
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
@@ -914,7 +1123,7 @@ bool Presenter::PresentLastFrame() {
 	if (m_impl->layers[0].frame == nullptr && m_impl->layers[1].frame == nullptr) {
 		return false;
 	}
-	m_impl->Present();
+	m_impl->Present(false);
 	return true;
 }
 
@@ -930,6 +1139,10 @@ bool Presenter::NeedsSystemOverlayRefresh() const noexcept {
 
 RenderContext& Presenter::Renderer() const noexcept {
 	return m_impl->renderer;
+}
+
+DlssFrameGeneration& Presenter::FrameGeneration() const noexcept {
+	return *m_impl->window.frame_generation;
 }
 
 void Presenter::Present(Frame& frame) {
@@ -963,15 +1176,32 @@ void Presenter::ClearLayer(int bus) {
 	}
 }
 
-void Presenter::Impl::Present() {
+void Presenter::Impl::Present(bool new_frame) {
 	KYTY_PROFILER_FUNCTION();
+	const auto timing_begin = timing.Enabled() ? Common::Timer::QueryPerformanceCounter() : 0;
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
+	auto* fg = window.frame_generation.get();
+	const bool foreground = fg && fg->Foreground();
+	const bool generate_frame = new_frame && foreground && !window.loop.paused.load() && layers[0].frame &&
+	    layers[0].frame->guest_frame && layers[0].frame->fg_inputs;
+	const bool keep_frame_generation = !new_frame && foreground && !window.loop.paused.load() && fg &&
+	    fg->Enabled() && Config::DlssFrameGenerationEnabled() && layers[0].frame &&
+	    layers[0].frame->guest_frame && layers[0].frame->fg_inputs;
+	const bool frame_generation_enabled = generate_frame || keep_frame_generation;
+	if (fg && fg->Enabled() && (!frame_generation_enabled || !Config::DlssFrameGenerationEnabled())) {
+		frames.WaitFrameGenerationInputs();
+	}
+	if (fg && fg->SetEnabled(frame_generation_enabled)) {
+		RecoverSwapchain(Swapchain::Status::Recreate);
+	}
 	// Some window systems keep presenting an old swapchain after a resize.
 	if (swapchain.NeedsResize()) {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
+		// Sleep before recording/locking; producers can keep submitting guest work.
+		bool fg_tag_failed = fg && fg->Enabled() && generate_frame && !fg->BeginFrame();
 		auto status = swapchain.AcquireNextImage();
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
@@ -984,21 +1214,53 @@ void Presenter::Impl::Present() {
 			    overlay_visual.active && swapchain.PrepareSystemOverlay();
 			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
 			                                draw_system_overlay);
-			const auto tick = swapchain.Submit(present_scheduler);
+			if (fg && fg->Enabled() && generate_frame && !fg_tag_failed) {
+				fg_tag_failed = !fg->TagFrame(command, *layers[0].frame->fg_inputs, swapchain.Extent());
+			}
+			uint64_t producer_tick = 0;
+			for (const auto& layer: layers) {
+				if (layer.frame) producer_tick = std::max(producer_tick, layer.frame->producer_tick);
+			}
+			const auto tick = swapchain.Submit(present_scheduler, producer_tick);
 			for (const auto& layer: layers) {
 				if (layer.frame != nullptr) {
 					layer.frame->present_tick = tick;
 				}
 			}
 		}
+		bool recreate_after_present = false;
+		if (fg_tag_failed) {
+			frames.WaitFrameGenerationInputs();
+			recreate_after_present = fg->SetEnabled(false);
+		}
+		if (fg && generate_frame) fg->PresentStart();
 		status = swapchain.Present();
+		if (fg) fg->PresentEnd(layers[0].frame ? layers[0].frame->fg_inputs.get() : nullptr, generate_frame);
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;
 		}
+		if (recreate_after_present) RecoverSwapchain(Swapchain::Status::Recreate);
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
-		window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
+		const bool new_guest_frame = new_frame &&
+		    std::any_of(layers.begin(), layers.end(), [](const auto& layer) {
+			    return layer.frame != nullptr && layer.frame->guest_frame;
+		    });
+		window.loop.dlss_active.store(layers[0].frame != nullptr && layers[0].frame->dlss_evaluated,
+		                              std::memory_order_relaxed);
+		window.loop.dlss_bypassed.store(layers[0].frame != nullptr && layers[0].frame->dlss_bypassed,
+		                                std::memory_order_relaxed);
+		window.loop.fg_enabled.store(fg && fg->Enabled(), std::memory_order_relaxed);
+		window.loop.fg_presented_frames.store(fg ? fg->TotalPresentedFrames() : 0,
+		                                      std::memory_order_relaxed);
+		if (new_guest_frame) window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
+		const auto* main_frame = layers[0].frame;
+		const auto preparation = new_guest_frame && main_frame && main_frame->guest_frame ?
+		    main_frame->preparation : FramePreparationTiming {};
+		const auto display_frames = new_guest_frame ? (fg && fg->Enabled() ? fg->PresentedFrames() : 1u) : 0u;
+		timing.Record(timing_begin, new_guest_frame,
+		              main_frame != nullptr && main_frame->dlss_evaluated, preparation, display_frames);
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
