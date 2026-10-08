@@ -224,9 +224,12 @@ struct TextureCacheTestAccess {
 
   static void ClearImage(TextureCache &cache, CommandBuffer &command, ImageId id,
                          const vk::ImageSubresourceRange &range,
-                         const vk::ClearValue &clear) {
+                         const vk::ClearValue &clear,
+                         vk::Format format = vk::Format::eUndefined) {
     auto lock = Lock(cache);
-    cache.ClearImage(command, id, cache.GetImage(id).backing.format, range, clear);
+    cache.ClearImage(command, id,
+                     format == vk::Format::eUndefined ? cache.GetImage(id).backing.format : format,
+                     range, clear);
   }
 
   static void ConfigureGarbageCollection(TextureCache &cache,
@@ -371,7 +374,20 @@ struct TextureCacheTestAccess {
     return mapping;
   }
 
+  static bool ReuseDownloadBuffer(TextureCache &cache, std::atomic<bool> &release) {
+    std::lock_guard lock(cache.m_lock);
+    auto &download = cache.m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+    release.store(true);
+    release.notify_one();
+    const auto [mapped, offset] = download.Map(download.Size(), 4);
+    if (mapped != nullptr) {
+      download.Commit();
+    }
+    return mapped != nullptr && offset == 0;
+  }
+
   static bool TryDownload(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
     return cache.DownloadImageMemory(id);
   }
 
@@ -5119,6 +5135,285 @@ public:
             "a metadata write-only fill was not consumed as a clear");
     scheduler.Finish();
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckLinearImageClearReadback() {
+    constexpr const char *name = "LinearImageClearReadback";
+    constexpr uintptr_t base = 0x0000000204800000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    constexpr uint64_t alignment = 0x10000;
+    constexpr uint32_t stale = 0x10203040u;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, alignment, 0, &direct_offset) == 0,
+            "linear-clear direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "linear-clear fixed direct-memory mapping failed");
+    LibKernel::Memory::InstallGpuResources(&context);
+    auto &cache = context.GetTextureCache();
+    const auto ReadWord = [&](uint64_t address) {
+      uint32_t word = 0;
+      Require(name, "read backing",
+              LibKernel::Memory::TryReadBacking(address, &word, sizeof(word)),
+              "linear-clear guest backing is unreadable");
+      return word;
+    };
+    const auto NewImage = [&](uint64_t offset) {
+      LibKernel::Memory::WriteBacking(base + offset, &stale, sizeof(stale));
+      auto desc = MakeLinearDesc(
+          base + offset, sizeof(uint32_t), vk::Format::eR32Uint,
+          Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+          {1, 1, 1}, 1, 4, 1);
+      return std::pair{cache.FindImage(desc), desc};
+    };
+    const auto Clear = [&](const TextureCache::ImageDesc &desc, uint32_t value) {
+      Require(name, "optimized buffer clear",
+              cache.ClearImageFromBuffer(scheduler.Current(), desc.info.data.address,
+                                          desc.info.data.size, value),
+              "buffer fill was not handled by the native image clear");
+    };
+    const auto Submit = [&](uint64_t address, uint32_t before, uint32_t after) {
+      const auto tick = scheduler.CurrentTick();
+      cache.ProcessDownloadImages();
+      Require(name, "deferred publication",
+              scheduler.CurrentTick() == tick && ReadWord(address) == before,
+              "linear clear submitted or published before GPU completion");
+      scheduler.Finish();
+      scheduler.DrainPriorityOperations();
+      Require(name, "completed publication", ReadWord(address) == after,
+              fmt::format("linear clear readback: actual=0x{:08x} expected=0x{:08x}",
+                          ReadWord(address), after));
+    };
+
+    TextureCacheTestAccess::SetLinearReadback(cache, true);
+    const auto [image, desc] = NewImage(0);
+    Clear(desc, 0xabcdef01u);
+    Submit(desc.info.data.address, stale, 0xabcdef01u);
+    Require(name, "native image retained",
+            TextureCacheTestAccess::Contains(cache, image) &&
+                cache.GetImage(image).SafeToDownload(),
+            "readback retired the native image or lost GPU ownership");
+    Clear(desc, 0x76543210u);
+    Clear(desc, 0x89abcdefu);
+    Submit(desc.info.data.address, 0xabcdef01u, 0x89abcdefu);
+    std::printf("[host]    %-32s optimized/repeated clear ok\n", name);
+
+    TextureCacheTestAccess::SetLinearReadback(cache, false);
+    const auto [disabled_image, disabled_desc] = NewImage(0x1000);
+    Clear(disabled_desc, 0x55555555u);
+    Submit(disabled_desc.info.data.address, stale, stale);
+    Require(name, "disabled readback GPU contents",
+            ReadCachedTexel(name, context, disabled_image) ==
+                std::vector<u32>{0x55555555u},
+            "disabled readback skipped the native GPU clear");
+    TextureCacheTestAccess::SetLinearReadback(cache, true);
+    Clear(disabled_desc, 0x66666666u);
+    Submit(disabled_desc.info.data.address, stale, 0x66666666u);
+    std::printf("[host]    %-32s readback option ok\n", name);
+
+    const auto [cpu_image, cpu_desc] = NewImage(0x2000);
+    Clear(cpu_desc, 0x77777777u);
+    constexpr uint32_t cpu_value = 0x12345678u;
+    cache.InvalidateMemory(cpu_desc.info.data.address, sizeof(cpu_value));
+    LibKernel::Memory::WriteBacking(cpu_desc.info.data.address, &cpu_value,
+                                    sizeof(cpu_value));
+    Submit(cpu_desc.info.data.address, cpu_value, cpu_value);
+    Require(name, "CPU ownership retained",
+            cache.GetImage(cpu_image).IsDefinitelyCpuDirty(),
+            "a stale image readback replaced the newer CPU contents");
+    std::printf("[host]    %-32s CPU supersession ok\n", name);
+
+    Clear(cpu_desc, 0xfeedfaceu);
+    const auto pending_tick = scheduler.CurrentTick();
+    cache.ProcessDownloadImages();
+    Require(name, "queued download remains deferred",
+            scheduler.CurrentTick() == pending_tick &&
+                ReadWord(cpu_desc.info.data.address) == cpu_value,
+            "download was published before submission");
+    cache.InvalidateMemory(cpu_desc.info.data.address, sizeof(cpu_value));
+    LibKernel::Memory::WriteBacking(cpu_desc.info.data.address, &cpu_value,
+                                    sizeof(cpu_value));
+    scheduler.Finish();
+    scheduler.DrainPriorityOperations();
+    Require(name, "CPU supersedes queued download",
+            ReadWord(cpu_desc.info.data.address) == cpu_value,
+            "deferred image publication overwrote a newer CPU write");
+    std::printf("[host]    %-32s queued CPU supersession ok\n", name);
+
+    std::atomic<bool> release_publication{false};
+    scheduler.DeferPriorityOperation([&release_publication] {
+      release_publication.wait(false);
+    });
+    Clear(desc, 0x10203040u);
+    cache.ProcessDownloadImages();
+    scheduler.Flush();
+    Require(name, "download buffer reuse",
+            TextureCacheTestAccess::ReuseDownloadBuffer(cache, release_publication),
+            "download buffer could not wrap after queued publication");
+    Require(name, "publication during buffer reuse",
+            ReadWord(desc.info.data.address) == 0x10203040u,
+            "buffer reuse did not wait for queued image publication");
+    scheduler.Finish();
+    scheduler.DrainPriorityOperations();
+    std::printf("[host]    %-32s download buffer reuse ok\n", name);
+
+    const auto [gc_image, gc_desc] = NewImage(0x8000);
+    Clear(gc_desc, 0xa1b2c3d4u);
+    const std::array gc_images{gc_image};
+    TextureCacheTestAccess::ConfigureGarbageCollection(cache, gc_images, 1000, 0);
+    cache.RunGarbageCollector();
+    Require(name, "GPU download survives eviction",
+            !TextureCacheTestAccess::Contains(cache, gc_image),
+            "garbage collection did not retire the test image");
+    scheduler.Finish();
+    scheduler.DrainPriorityOperations();
+    Require(name, "evicted GPU contents published",
+            ReadWord(gc_desc.info.data.address) == 0xa1b2c3d4u,
+            "retiring the image discarded its queued GPU download");
+
+    const auto [gc_cpu_image, gc_cpu_desc] = NewImage(0x9000);
+    Clear(gc_cpu_desc, 0xdeadbeefu);
+    const std::array gc_cpu_images{gc_cpu_image};
+    TextureCacheTestAccess::ConfigureGarbageCollection(cache, gc_cpu_images, 2000, 0);
+    cache.RunGarbageCollector();
+    Require(name, "CPU invalidation after eviction",
+            !TextureCacheTestAccess::Contains(cache, gc_cpu_image),
+            "garbage collection did not retire the CPU-supersession test image");
+    cache.InvalidateMemory(gc_cpu_desc.info.data.address, sizeof(cpu_value));
+    LibKernel::Memory::WriteBacking(gc_cpu_desc.info.data.address, &cpu_value,
+                                    sizeof(cpu_value));
+    scheduler.Finish();
+    scheduler.DrainPriorityOperations();
+    Require(name, "CPU supersedes evicted download",
+            ReadWord(gc_cpu_desc.info.data.address) == cpu_value,
+            "an evicted image's queued download overwrote newer CPU contents");
+    std::printf("[host]    %-32s eviction publication/supersession ok\n", name);
+
+    const auto [unmapped_image, unmapped_desc] = NewImage(0xa000);
+    Clear(unmapped_desc, 0xf0f0f0f0u);
+    cache.ProcessDownloadImages();
+    cache.UnmapMemory(unmapped_desc.info.data.address, unmapped_desc.info.data.size);
+    scheduler.Finish();
+    scheduler.DrainPriorityOperations();
+    Require(name, "queued download cancelled on unmap",
+            !TextureCacheTestAccess::Contains(cache, unmapped_image) &&
+                ReadWord(unmapped_desc.info.data.address) == stale,
+            "an unmapped image's queued download published retired contents");
+
+    const auto [retired_image, retired_desc] = NewImage(0x3000);
+    Clear(retired_desc, 0x88888888u);
+    cache.UnmapMemory(retired_desc.info.data.address, retired_desc.info.data.size);
+    Submit(retired_desc.info.data.address, stale, stale);
+    Require(name, "retired image removed",
+            !TextureCacheTestAccess::Contains(cache, retired_image),
+            "unmapping retained a pending clear readback image");
+    const auto [replacement_image, replacement_desc] = NewImage(0x3000);
+    Clear(replacement_desc, 0x99999999u);
+    Submit(replacement_desc.info.data.address, stale, 0x99999999u);
+    Require(name, "new image generation",
+            replacement_image != retired_image,
+            "readback retirement reused the stale image identity");
+    std::printf("[host]    %-32s retirement/reuse ok\n", name);
+
+    if (RasterizationSupported()) {
+      const auto [alias_image, alias_desc] = NewImage(0x4000);
+      vk::ClearValue alias_clear{};
+      alias_clear.color.float32 = std::array{1.0f, 0.0f, 0.0f, 0.0f};
+      TextureCacheTestAccess::ClearImage(
+          cache, scheduler.Current(), alias_image,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, alias_clear,
+          vk::Format::eR32Sfloat);
+      Submit(alias_desc.info.data.address, stale, 0x3f800000u);
+      std::printf("[host]    %-32s format-alias clear ok\n", name);
+    } else {
+      std::printf("[host]    %-32s format-alias clear skipped: rasterization unavailable\n", name);
+    }
+
+    auto tiled_desc = MakeLinearDesc(
+        base + 0x5000, 0x1000, vk::Format::eR32Uint,
+        Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+        {32, 32, 1}, 1, 4, 1);
+    tiled_desc.info.tile_mode = Prospero::TileMode::kStandard4KB;
+    LibKernel::Memory::WriteBacking(tiled_desc.info.data.address, &stale,
+                                    sizeof(stale));
+    const auto tiled_image = cache.FindImage(tiled_desc);
+    Clear(tiled_desc, 0xaabbccddu);
+    Submit(tiled_desc.info.data.address, stale, stale);
+    Require(name, "tiled clear retained",
+            ReadCachedTexel(name, context, tiled_image) ==
+                std::vector<u32>{0xaabbccddu},
+            "linear readback policy skipped the native tiled-image clear");
+    std::printf("[host]    %-32s tiled exclusion ok\n", name);
+
+    constexpr uint32_t width = 3, height = 2, pitch = 256 / sizeof(uint32_t), layers = 2;
+    std::array<uint32_t, pitch * height * layers> padded_before{};
+    for (uint32_t index = 0; index < padded_before.size(); ++index) {
+      padded_before[index] = 0x51000000u + index;
+    }
+    auto padded_desc = MakeLinearDesc(
+        base + 0x6000, sizeof(padded_before), vk::Format::eR32Uint,
+        Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+        {width, height, 1}, layers, 4, 1);
+    padded_desc.info.pitch = pitch;
+    padded_desc.info.mip_layout[0] = {0, sizeof(padded_before) / layers, pitch, height};
+    LibKernel::Memory::WriteBacking(padded_desc.info.data.address,
+                                    padded_before.data(), sizeof(padded_before));
+    const auto padded_image = cache.FindImage(padded_desc);
+    Clear(padded_desc, 0xcafef00du);
+    const auto padded_tick = scheduler.CurrentTick();
+    cache.ProcessDownloadImages();
+    decltype(padded_before) padded_pending{};
+    Require(name, "padded deferred publication",
+            LibKernel::Memory::TryReadBacking(padded_desc.info.data.address,
+                                              padded_pending.data(), sizeof(padded_pending)) &&
+                padded_pending == padded_before &&
+                scheduler.CurrentTick() == padded_tick,
+            "padded array was published before GPU completion");
+    scheduler.Finish();
+    scheduler.DrainPriorityOperations();
+    decltype(padded_before) padded_after{};
+    Require(name, "padded readback",
+            LibKernel::Memory::TryReadBacking(padded_desc.info.data.address,
+                                              padded_after.data(), sizeof(padded_after)),
+            "padded array backing is unreadable");
+    for (uint32_t index = 0; index < padded_after.size(); ++index) {
+      const uint32_t expected = index % pitch < width ? 0xcafef00du : padded_before[index];
+      Require(name, "array pixels and row padding", padded_after[index] == expected,
+              fmt::format("array word {}: actual=0x{:08x} expected=0x{:08x}",
+                          index, padded_after[index], expected));
+    }
+    Require(name, "padded image retained",
+            TextureCacheTestAccess::Contains(cache, padded_image),
+            "array readback retired its native image");
+    std::printf("[host]    %-32s array/padding preservation ok\n", name);
+
+    TextureCacheTestAccess::SetLinearReadback(cache, false);
+    context.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    scheduler.DrainPriorityOperations();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap backing",
+            LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "linear-clear mapping release failed");
+    Require(name, "release backing",
+            LibKernel::Memory::KernelReleaseDirectMemory(direct_offset,
+                                                         allocation_size) == 0,
+            "linear-clear allocation release failed");
   }
 
   void CheckBdaPageTableUploads() {
@@ -14406,15 +14701,6 @@ public:
                   !TextureCacheTestAccess::PendingDownload(
                       texture_cache, target_subresource_id),
               "FindImage claimed RenderExecutor-owned render-target state");
-      vk::ClearValue target_clear{};
-      target_clear.color.uint32[0] = 0x12345678;
-      TextureCacheTestAccess::ClearImage(
-          texture_cache, scheduler.Current(), target_base_subresource_id,
-          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, target_clear);
-      target_clear.color.uint32[0] = 0x89abcdef;
-      TextureCacheTestAccess::ClearImage(
-          texture_cache, scheduler.Current(), target_subresource_id,
-          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, target_clear);
       RenderExecutorTestAccess::BindRenderTarget(executor,
                                                  target_subresource_id);
       Require(name, "target prefetch purity",
@@ -14424,6 +14710,15 @@ public:
                   !TextureCacheTestAccess::PendingDownload(
                       texture_cache, target_subresource_id),
               "target prefetch performed final target acquisition");
+      vk::ClearValue target_clear{};
+      target_clear.color.uint32[0] = 0x12345678;
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), target_base_subresource_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, target_clear);
+      target_clear.color.uint32[0] = 0x89abcdef;
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), target_subresource_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, target_clear);
       const auto target_parent_id = texture_cache.FindImage(target_parent);
       Require(name, "active target overlap",
               target_parent_id &&
@@ -41737,6 +42032,11 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--linear-clear-readback-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckLinearImageClearReadback();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeThreadDimensions(vulkan);
@@ -42692,6 +42992,9 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
+  if (rasterization) {
+    vulkan.CheckLinearImageClearReadback();
+  }
   vulkan.CheckBdaPageTableUploads();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
