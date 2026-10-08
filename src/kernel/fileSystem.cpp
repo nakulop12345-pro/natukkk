@@ -84,6 +84,17 @@ public:
 
 	KYTY_CLASS_NO_COPY(FileDescriptors);
 
+	// Calls func with the File for d (nullptr if there is none) while the table lock is held,
+	// so a concurrent KernelClose cannot delete it. func must not call back into the table.
+	template <typename Func>
+	int UseFile(int d, Func&& func) {
+		Common::LockGuard lock(m_mutex);
+
+		auto index = static_cast<size_t>(d - DESCRIPTOR_MIN);
+
+		return func(index < m_files.size() ? m_files[index] : nullptr);
+	}
+
 	int   CreateDescriptor();
 	void  DeleteDescriptor(int d);
 	File* GetFile(int d);
@@ -574,11 +585,16 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 
 	EXIT_IF(!file->opened);
 
-	if (!file->directory && file->special == SpecialFile::None) {
-		file->f.Close();
-	}
+	{
+		// Wait for an operation that holds the file lock, such as KernelFsync, before closing.
+		Common::LockGuard lock(file->mutex);
 
-	file->opened = false;
+		if (!file->directory && file->special == SpecialFile::None) {
+			file->f.Close();
+		}
+
+		file->opened = false;
+	}
 
 	LOGF("\tClose: %s\n", Common::PathToString(file->real_name).c_str());
 
@@ -1407,7 +1423,12 @@ int KYTY_SYSV_ABI KernelRmdir(const char* path) {
 	}
 
 	if (!Common::File::IsDirectoryExisting(real_name)) {
-		return KERNEL_ERROR_ENOENT;
+		return Common::File::IsFileExisting(real_name) ? KERNEL_ERROR_ENOTDIR : KERNEL_ERROR_ENOENT;
+	}
+
+	std::error_code ec;
+	if (!std::filesystem::is_empty(real_name, ec) && !ec) {
+		return KERNEL_ERROR_ENOTEMPTY;
 	}
 
 	if (!Common::File::DeleteDirectory(real_name)) {
@@ -1443,6 +1464,108 @@ int KYTY_SYSV_ABI KernelCheckReachability(const char* path) {
 	}
 
 	return KERNEL_ERROR_ENOENT;
+}
+
+int KYTY_SYSV_ABI KernelFsync(int d) {
+	PRINT_NAME();
+
+	LOGF("\t fd = %d\n", d);
+
+	if (d < 0) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	if (d < DESCRIPTOR_MIN) {
+		// The standard streams are terminals, and KernelWrite already flushes them.
+		return OK;
+	}
+
+	if (::Libs::Network::Net::IsSocket(d)) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	// Flush with the table lock held so that a concurrent KernelClose cannot free the File.
+	return g_files->UseFile(d, [](File* file) -> int {
+		if (file == nullptr) {
+			return KERNEL_ERROR_EBADF;
+		}
+
+		Common::LockGuard lock(file->mutex);
+
+		if (!file->opened) {
+			return KERNEL_ERROR_EBADF;
+		}
+
+		if (!file->writable || file->directory || file->special != SpecialFile::None) {
+			return OK;
+		}
+
+		if (file->f.IsInvalid() || !file->f.Flush()) {
+			return KERNEL_ERROR_EIO;
+		}
+
+		return OK;
+	});
+}
+
+// Guest permissions are not emulated (stat reports every file as 0777), so a mode change only
+// has to fail the way the console would for a missing path or a read-only mount.
+int KYTY_SYSV_ABI KernelChmod(const char* path, uint16_t mode) {
+	PRINT_NAME();
+
+	if (path == nullptr) {
+		return KERNEL_ERROR_EFAULT;
+	}
+
+	LOGF("\t path = %s, mode = 0%o\n", path, static_cast<unsigned>(mode));
+
+	const std::string mounted_path(path);
+
+	if (IsRandomDevice(mounted_path)) {
+		return OK;
+	}
+
+	auto real_name = g_mount_points->ResolvePath(mounted_path);
+
+	if (!Common::File::GetInfo(real_name)) {
+		return KERNEL_ERROR_ENOENT;
+	}
+
+	if (Common::IsArchivePath(real_name)) {
+		return KERNEL_ERROR_EROFS;
+	}
+
+	return OK;
+}
+
+int KYTY_SYSV_ABI KernelFchmod(int d, uint16_t mode) {
+	PRINT_NAME();
+
+	LOGF("\t fd = %d, mode = 0%o\n", d, static_cast<unsigned>(mode));
+
+	if (d < 0) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	if (d < DESCRIPTOR_MIN) {
+		return OK;
+	}
+
+	if (::Libs::Network::Net::IsSocket(d)) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	return g_files->UseFile(d, [](File* file) -> int {
+		if (file == nullptr || !file->opened) {
+			return KERNEL_ERROR_EBADF;
+		}
+
+		if (file->special == SpecialFile::None && Common::IsArchivePath(file->real_name)) {
+			return KERNEL_ERROR_EROFS;
+		}
+
+		return OK;
+	});
 }
 
 } // namespace Libs::LibKernel::FileSystem
