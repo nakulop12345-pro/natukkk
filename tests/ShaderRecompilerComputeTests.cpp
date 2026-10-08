@@ -10404,6 +10404,16 @@ public:
             DecodePackedColorClear(vk::Format::eR16Sfloat, 0x7e00u, clear) &&
                 std::isnan(clear.float32[0]),
             "half NaN did not remain NaN");
+    Require(name, "64-bit register clear",
+            DecodeRegisterColorClear(vk::Format::eR16G16B16A16Sfloat,
+                                     0xbc003c00u, 0x40003800u, clear) &&
+                std::bit_cast<std::array<uint32_t, 4>>(clear.float32) ==
+                    std::bit_cast<std::array<uint32_t, 4>>(
+                        std::array<float, 4>{1.0f, -1.0f, 0.5f, 2.0f}) &&
+                DecodeRegisterColorClear(vk::Format::eR32G32Sfloat, 0x3f800000u,
+                                         0xc0000000u, clear) &&
+                clear.float32[0] == 1.0f && clear.float32[1] == -2.0f,
+            "64-bit register clear ignored CB_COLOR_CLEAR_WORD1");
     for (const auto format : {vk::Format::eR16Sfloat, vk::Format::eR16Unorm}) {
       Require(name, "R16 DWORD fill",
               !DecodeColorDwordFill(format, 0xbc003c00u, clear) &&
@@ -10722,6 +10732,84 @@ public:
         Require(name, "complete fill after partial fill",
                 read_texel() == expected,
                 "completing the metadata overwrite did not restore its clear");
+        // A texture view of the fast-cleared target sees the clear without a
+        // color bind.
+        paint();
+        fill_metadata(metadata_words);
+        {
+          ImageDesc sampled = color.desc;
+          sampled.type = BindingType::Texture;
+          sampled.info.metadata = {};
+          sampled.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+          RenderExecutorTestAccess::ResetBindings(executor);
+          const auto sampled_id = texture_cache.FindImage(sampled);
+          (void)texture_cache.FindTexture(sampled_id, sampled);
+          Require(name, "texture view reuses target image",
+                  sampled_id == color.image_id,
+                  "a texture view of the fast-cleared target created another "
+                  "image");
+          Require(
+              name, "texture view sees metadata clear",
+              read_texel() == expected,
+              "a texture binding read drawn texels of a fast-cleared target");
+        }
+        bind();
+        // A texture view carrying the target's metadata, without the clear
+        // registers a T# lacks, still uses the target's registers. The target
+        // is unprogrammed during the fill so only the view can apply the clear.
+        paint();
+        registers.SetColorBase(0, {.addr = 0});
+        fill_metadata(metadata_words);
+        registers.SetColorBase(0, {.addr = base});
+        {
+          ImageDesc sampled = color.desc;
+          sampled.type = BindingType::Texture;
+          sampled.info.metadata.clear_register_valid = false;
+          sampled.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+          RenderExecutorTestAccess::ResetBindings(executor);
+          const auto sampled_id = texture_cache.FindImage(sampled);
+          (void)texture_cache.FindTexture(sampled_id, sampled);
+          Require(name, "metadata texture view sees target clear",
+                  sampled_id == color.image_id && read_texel() == expected,
+                  "a texture view with metadata lost the target's clear "
+                  "registers");
+        }
+        bind();
+        // A later binding of the target without color metadata forgets the
+        // old clear state, so a texture view keeps the drawn texels.
+        {
+          // Fresh clear keys, with the target unprogrammed so no draw or
+          // dispatch consumes them before the metadata-less rebind.
+          registers.SetColorBase(0, {.addr = 0});
+          fill_metadata(metadata_words);
+          registers.SetColorBase(0, {.addr = base});
+          ImageDesc plain = color.desc;
+          plain.info.metadata = {};
+          (void)texture_cache.FindImage(plain);
+          paint();
+          ImageDesc sampled = color.desc;
+          sampled.type = BindingType::Texture;
+          sampled.info.metadata = {};
+          sampled.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+          RenderExecutorTestAccess::ResetBindings(executor);
+          const auto sampled_id = texture_cache.FindImage(sampled);
+          (void)texture_cache.FindTexture(sampled_id, sampled);
+          Require(name, "metadata-less rebind forgets the clear",
+                  sampled_id == color.image_id && retains_painted_texel(),
+                  "a texture view applied the clear state of an earlier "
+                  "binding");
+        }
+        bind();
+        // The metadata fill of a programmed target clears it even without a
+        // draw; the second dispatch stands for any later GPU work.
+        paint();
+        RenderExecutorTestAccess::ResetBindings(executor);
+        fill_metadata(metadata_words);
+        fill_metadata(metadata_words);
+        Require(name, "metadata fill clears without a draw",
+                read_texel() == expected,
+                "a metadata fill without a following draw left drawn texels");
+        bind();
 
         // Consuming a clear key updates metadata backing without invalidating
         // a pooled image whose first texel precedes the metadata range.
