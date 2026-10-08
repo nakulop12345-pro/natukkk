@@ -18351,6 +18351,9 @@ private:
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
     m_rasterization_supported = available_features.fillModeNonSolid &&
+#if !defined(__APPLE__)
+                                available_features.depthClamp &&
+#endif
                                 available_features.tessellationShader &&
                                 available_features.depthBounds &&
                                 available_depth_clip.depthClipEnable &&
@@ -18436,6 +18439,9 @@ private:
     device_features.fillModeNonSolid = m_rasterization_supported;
     device_features.tessellationShader = m_rasterization_supported;
     device_features.depthBounds = m_rasterization_supported;
+#if !defined(__APPLE__)
+    device_features.depthClamp = m_rasterization_supported;
+#endif
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
@@ -18974,6 +18980,16 @@ void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
   auto actual = vulkan->RenderFragment(test, compiled);
   CompareGraphicsWords(test, actual);
   std::printf("[graphics] %-31s ok\n", test.name);
+}
+
+bool RasterizationChecksAvailable(const VulkanHarness &vulkan) {
+  if (vulkan.RasterizationSupported()) {
+    return true;
+  }
+  std::printf(
+      "ShaderRecompilerComputeTests: device rasterization checks skipped, this "
+      "device does not support the production rasterization features\n");
+  return false;
 }
 
 enum class CoverageClass {
@@ -42411,14 +42427,19 @@ int main(int argc, char **argv) {
     CheckDepthFeedbackAspects();
     CheckDynamicRenderingState();
     VulkanHarness vulkan;
-    vulkan.CheckRasterization(false);
+    const bool rasterization = RasterizationChecksAvailable(vulkan);
+    if (rasterization) {
+      vulkan.CheckRasterization(false);
+    }
     vulkan.CheckRenderExecutorColorDiscovery();
     vulkan.CheckRenderExecutorColor1DArrayDiscovery();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
-    vulkan.CheckRenderExecutorStencilBindingDiscovery();
+    if (rasterization) {
+      vulkan.CheckRenderExecutorStencilBindingDiscovery();
+    }
     vulkan.CheckUnifiedTextureCacheFlow();
     vulkan.CheckBgra16Readback();
     return 0;
@@ -42435,9 +42456,11 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--polygon-mode-only") == 0) {
     VulkanHarness vulkan;
-    vulkan.CheckRasterization(false);
-    vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
-    vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
+    if (RasterizationChecksAvailable(vulkan)) {
+      vulkan.CheckRasterization(false);
+      vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
+      vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
+    }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--htile-clear-only") == 0) {
@@ -42458,7 +42481,9 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
-    vulkan.CheckRenderExecutorStencilBindingDiscovery();
+    if (RasterizationChecksAvailable(vulkan)) {
+      vulkan.CheckRenderExecutorStencilBindingDiscovery();
+    }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--native-indirect-only") == 0) {
@@ -42512,7 +42537,9 @@ int main(int argc, char **argv) {
     CheckSampledDepthResource();
     CheckDepthTextureEncoding();
     vulkan.CheckComparisonDepthTexture();
-    vulkan.CheckRasterization(true);
+    if (RasterizationChecksAvailable(vulkan)) {
+      vulkan.CheckRasterization(true);
+    }
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
     return 0;
   }
@@ -42541,7 +42568,9 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-rebind-only") == 0) {
     VulkanHarness vulkan;
-    vulkan.CheckRenderExecutorStencilBindingDiscovery();
+    if (RasterizationChecksAvailable(vulkan)) {
+      vulkan.CheckRenderExecutorStencilBindingDiscovery();
+    }
     return 0;
   }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -42576,7 +42605,9 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-mip-host-only") == 0) {
     VulkanHarness vulkan;
-    vulkan.CheckRenderExecutorStencilBindingDiscovery();
+    if (RasterizationChecksAvailable(vulkan)) {
+      vulkan.CheckRenderExecutorStencilBindingDiscovery();
+    }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-mip-only") == 0) {
