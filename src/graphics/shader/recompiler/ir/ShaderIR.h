@@ -472,6 +472,9 @@ struct ShaderInfo {
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
 	bool                             uses_ordered_append  = false;
+	// Waves per workgroup and wave size used to rebuild a wave's dispatch-order rank.
+	uint32_t ordered_append_waves     = 0;
+	uint32_t ordered_append_wave_size = 0;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
